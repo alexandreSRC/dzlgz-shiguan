@@ -1,0 +1,37 @@
+# ══ 密钥 / 本机运行配置（config.json 含 API Key 与个人设置）══
+config.json
+*.log
+
+# ══ 谱牒数据 · 游戏存档 · 个人数据（体积大且含个人内容）══
+saves/
+Save_All_*/
+staging/
+
+# ══ 开发过程产物 ══
+_scratch/
+_stats/
+_backup_*/
+
+# ══ 构建产物与二进制 ══
+build/
+dist/
+*.exe
+*.apk
+__pycache__/
+*.py[cod]
+pad-android/.gradle/
+pad-android/.kotlin/
+pad-android/build/
+pad-android/app/build/
+pad-android/local.properties
+
+# ══ 快捷方式 / 临时 / 系统 ══
+*.lnk
+*.tmp
+*.tmp_*
+_shiguan_slots.json
+Thumbs.db
+.DS_Store
+
+# 项目日志暂不公开；如需公开，删掉下面这一行
+项目日志.md

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tk 主题实测真值（2026-09-29 探针读 theme 对象所得） -->
+    <color name="bg_app">#F2ECDC</color>
+    <color name="bg_bar">#F8F4E8</color>
+</resources>

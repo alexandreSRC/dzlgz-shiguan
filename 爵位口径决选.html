@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>爵位口径决选 · 大周列国志史馆</title>
+<style>
+  body { background:#f7f2e7; color:#3a2f22; font-family:"Microsoft YaHei",sans-serif;
+         max-width:860px; margin:24px auto; padding:0 16px; line-height:1.7; }
+  h1 { font-size:22px; border-bottom:3px solid #b8860b; padding-bottom:8px; }
+  h1 small { font-size:13px; color:#7a6a52; font-weight:normal; }
+  .q { background:#fffdf6; border:1px solid #d8cdb4; border-left:5px solid #b8860b;
+       border-radius:6px; padding:12px 16px; margin:14px 0; }
+  .q h2 { font-size:16px; margin:0 0 6px; }
+  .q p.why { font-size:13px; color:#7a6a52; margin:4px 0 8px; }
+  label { display:block; padding:5px 8px; border-radius:4px; cursor:pointer; font-size:14px; }
+  label:hover { background:#f3ead2; }
+  label.cur { font-weight:bold; }
+  .tag { display:inline-block; font-size:11px; background:#4CAF50; color:#fff;
+         border-radius:3px; padding:0 5px; margin-left:6px; vertical-align:1px; }
+  .btn { background:#2e7d32; color:#fff; border:none; border-radius:5px;
+         padding:10px 22px; font-size:15px; cursor:pointer; margin:14px 4px 0 0; }
+  .btn.gray { background:#8d7f6a; }
+  textarea { width:100%; height:130px; margin-top:12px; font-size:13px;
+             background:#fffdf6; border:1px solid #d8cdb4; border-radius:5px;
+             padding:8px; }
+  .note { font-size:13px; color:#7a6a52; }
+</style>
+</head>
+<body>
+<h1>爵位口径决选 <small>大周列国志 · 史馆 —— 点选后生成一段文字，粘贴给 AI 即可落规则</small></h1>
+<div class="note">每题标 <span class="tag">现行</span> 的是当前程序行为。不想改的题不用动，保持默认即可。</div>
+<div id="qs"></div>
+<button class="btn" onclick="gen()">生成我的选择</button>
+<button class="btn gray" onclick="document.getElementById('out').select();document.execCommand('copy');this.textContent='已复制 ✓'">复制</button>
+<textarea id="out" readonly placeholder="点「生成我的选择」后，把这里的内容复制给 AI。"></textarea>
+<script>
+const QS = [
+ { t:"1. 王族成员的「王」色（如毕公高之子毕克，游戏原文爵位就写着王）",
+   why:"游戏对王族常把爵位字段直接写「王」，不筛会整族上成王色。",
+   o:[["A","降回实际爵位（毕氏→侯，走史料层/国爵表）",1],
+      ["B","跟随原文，全族王色"],
+      ["C","单独设一个「王族」色（金框银底之类），与天子王色区分开"]] },
+ { t:"2. 天子（夏商周王）怎么认",
+   why:"现行按「世系或势力 = 王朝名」；世系被宗庙共祭污染时会漏（靠尊号兜）。",
+   o:[["A","世系或势力 = 王朝名（现行）",1],
+      ["B","只认势力 = 王朝名（更严，但污染时更容易漏）"],
+      ["C","只认真在位的（有王号尊号的）"]] },
+ { t:"3. 史料层与游戏原文冲突时（齐君原文写「公」，金文史料是「侯」）",
+   why:"现行史料层优先：杞 公→子、卫 伯→侯→公、楚 子→王 全靠这层。",
+   o:[["A","史料层优先（现行）",1],
+      ["B","游戏原文优先（所见即游戏）"],
+      ["C","颜色用史料层，详情卡里两说并存"]] },
+ { t:"4. 夏商周的「帝」号（多为主死后的神号）",
+   why:"现行一律王色；帝色只给上古三皇五帝与秦以后的真皇帝。",
+   o:[["A","一律王色（现行）",1],
+      ["B","保留帝色（帝号就给帝）"]] },
+ { t:"5. 僭号称王（楚/吴/越没获周封自己称王）",
+   why:"现行按史料记载的称王年份动态给色（楚 前704 前是子、之后是王）。",
+   o:[["A","按史料年份动态（现行）",1],
+      ["B","始终按周封爵（楚永远是子）"],
+      ["C","有王号就始终王色（不看年份）"]] },
+ { t:"6. 已故人物的底色与爵色",
+   why:"现行已故=灰底+爵色描边；本轮时间轴铭牌改成了爵色整块填充。",
+   o:[["A","已故灰底优先（现行）",1],
+      ["B","爵色填底，灰字示已故"],
+      ["C","不分生死，一律爵色填底"]] },
+ { t:"7. 女性名字标红与爵色底的关系",
+   why:"现行女性名字一律红（既定规则）；爵色填底后红字在深底上可能不够清楚。",
+   o:[["A","维持红名（现行）",1],
+      ["B","有爵色底时改按底色黑白，无底才红"],
+      ["C","红名 + 爵色淡底（底色调淡保证红字可读）"]] },
+ { t:"8. 时间轴铭牌的爵色表达",
+   why:"本轮已从「四边描边」改为「整块填充试试」。",
+   o:[["A","整块填充（本轮新改）",1],
+      ["B","退回四边描边"],
+      ["C","只左沿一道色条（最早版）"]] },
+];
+const box = document.getElementById("qs");
+QS.forEach((q, i) => {
+  const d = document.createElement("div"); d.className = "q";
+  d.innerHTML = `<h2>${q.t}</h2><p class="why">${q.why}</p>`;
+  q.o.forEach(([k, txt, cur]) => {
+    const l = document.createElement("label");
+    l.innerHTML = `<input type="radio" name="q${i}" value="${k}" ${cur?"checked":""}> ${k}. ${txt}`
+                + (cur ? `<span class="tag">现行</span>` : ``);
+    d.appendChild(l);
+  });
+  box.appendChild(d);
+});
+function gen() {
+  const lines = ["【爵位口径决选】"];
+  QS.forEach((q, i) => {
+    const sel = document.querySelector(`input[name=q${i}]:checked`).value;
+    const opt = q.o.find(o => o[0] === sel);
+    lines.push(`${q.t.split("（")[0].split("（")[0].trim()} → ${sel}. ${opt[1]}${opt[2] ? "（维持现行）" : "（改）"}`);
+  });
+  document.getElementById("out").value = lines.join("\n");
+}
+</script>
+</body>
+</html>

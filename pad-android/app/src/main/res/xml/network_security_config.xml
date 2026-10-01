@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  平板直连 PC 用的都是**局域网明文 HTTP**（http://192.168.x.x:8801）。
+  安卓 9+ 默认禁止明文，所以要显式放开；本 App 只连自家 PC，故整体放开明文，
+  出网仍受系统管控。（`<domain>` 只接受主机名/域名，写不了网段 —— 所以用 base-config。）
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
