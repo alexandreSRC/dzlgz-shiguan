@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      主题：底色直接用 Tk 主题的实测真值，避免启动瞬间闪白/闪黑。
+      （见 shiguan-conventions：配色一律读被复刻方的真值，不照图猜。）
+    -->
+    <style name="Theme.ShiguanPad" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg_app</item>
+        <item name="android:statusBarColor">@color/bg_bar</item>
+        <item name="android:navigationBarColor">@color/bg_bar</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
