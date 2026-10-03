@@ -13,6 +13,7 @@ Tkinter 的 create_text 绝不传 width（否则竖排会被折成两列）。
 """
 import logging
 import tkinter as tk
+import os
 import tkinter.font as tkfont
 
 from .. import bio as bio_mod
@@ -211,6 +212,37 @@ class TreeView:
                     )
                     self._draw()
 
+    def _box_title_cx(self, min_x, max_x, tw, ty, th, band_hit):
+        """框题的水平落位 x —— **居中优先**，撞到节点就逐级退让。
+
+        ★ 2026-10-01 使用者：「时间家谱和代际家谱的『X国世系』要在框内居中」。
+          时间轴那边本来就是居中（`cx = 框中点`）；代际这边原来固定贴左沿
+          （2026-09-26 为躲节点的「史」徽标改的），现改成居中优先。
+          框顶虽留了 38px 的标题带，但横向上常被**本族第一代的节点**
+          （它恰在框中心）或**邻支节点**占住 —— 所以做成：
+          居中 → 偏左 → 偏右 → 贴左 → 贴右，取第一个不撞的；
+          全撞则返回 None（调用方跳过它 —— 宁可不画标题，也不让字压名字）。
+        """
+        half = tw / 2
+        lo = min_x + 8 + half          # 贴左沿（旧口径的落点）
+        hi = max_x - 8 - half          # 贴右沿
+        if hi < lo:
+            lo = hi = (min_x + max_x) / 2     # 框太窄：只能摆中间
+        mid = min(max((min_x + max_x) / 2, lo), hi)
+        span = hi - lo
+        cands = [mid]
+        if span > 0.5:
+            cands += [lo + span * 0.34, lo + span * 0.66, lo, hi]
+        seen = set()
+        for cx in cands:
+            k = round(cx, 2)
+            if k in seen:
+                continue
+            seen.add(k)
+            if not band_hit(cx - half, ty, cx + half, ty + th):
+                return cx
+        return None
+
     def _draw(self):
         c = self.canvas
         c.delete("all")
@@ -283,9 +315,11 @@ class TreeView:
                 _fs = max(6.0, _fs * avail / need)
                 need = est_text_px(title, _fs) + 10
             tw = min(need, avail)
-            cx = min_x + tw / 2 + 8
             ty = min_y + 2 * self.scale
-            if band_hit(cx - tw / 2, ty, cx + tw / 2, ty + _th):
+            # ★ 2026-10-01 使用者要求「X国世系」在框内**居中**（原来贴左沿）：
+            #   居中优先、撞了逐级退让（见 `_box_title_cx`），全撞才不画。
+            cx = self._box_title_cx(min_x, max_x, tw, ty, _th, band_hit)
+            if cx is None:
                 continue
             c.create_rectangle(cx - tw / 2, ty, cx + tw / 2, ty + _th,
                                fill=color, outline=color, tags="boxtitle")
@@ -302,9 +336,10 @@ class TreeView:
                 _fs = max(6.0, _fs * avail / need)
                 need = est_text_px(title, _fs) + 10
             tw = min(need, avail)
-            cx = min_x + tw / 2 + 8
             ty = min_y + 2 * self.scale
-            if band_hit(cx - tw / 2, ty, cx + tw / 2, ty + _th):
+            # 卿内框同规：居中优先、逐级退让（与上面的国世系框一致）
+            cx = self._box_title_cx(min_x, max_x, tw, ty, _th, band_hit)
+            if cx is None:
                 continue
             c.create_rectangle(cx - tw / 2, ty, cx + tw / 2, ty + _th,
                                fill=color, outline=color, tags="boxtitle")
@@ -652,6 +687,9 @@ class TreeView:
 
     def _paint_viewport(self):
         """按需绘制：画布上**只留「视口 ± 半屏」里的人**（连同他们的连线）。
+
+        `full=True`（整块导出用）：一拍把 keep 里的人**全部**画完，
+        不走 800/拍的分批 —— 导出等不了多拍渐进。
 
         取代了"把全谱 13,526 人分批画完"的旧方案（使用者实测它有三个病：
         打开后画不完、滚动不补、拖动不补）：
@@ -1089,7 +1127,7 @@ class TreeView:
             return
         self._center_on(*self.lay.positions[name])
 
-    def export_full(self, path_prefix, on_progress=None, max_side=16000):
+    def export_full(self, path_prefix, on_progress=None, max_side=9000):
         """★ 2026-09-27 v3 整块画布导出（使用者思路：虚拟超级大屏）。
 
         收起侧栏 → 把主窗口临时拉成「画布全宽 × 全高」的超级大窗
@@ -1100,6 +1138,7 @@ class TreeView:
         """
         import math
         from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None   # 自己导出的图，解除 1.79 亿像素上限
         from app import wincap
         if self.lay is None:
             raise RuntimeError("画布还没有布局（先打开一个谱牒）")
@@ -1122,9 +1161,21 @@ class TreeView:
             # ② 窗口拉成「画布全尺寸 + 边距」的超级大窗（等效虚拟大屏）
             new_w = min(max_side, max(rel_x + total_w + 12, c.winfo_width()))
             new_h = min(max_side, max(rel_y + total_h + 12, c.winfo_height()))
-            top.geometry(f"{new_w}x{new_h}+0+0")
+            # ★ 虚拟大屏定位（使用者思路）：装了虚拟显示器驱动
+            #   （Parsec VDD 等）时，虚拟屏在主屏右侧 —— 大窗摆过去，
+            #   **使用者的桌面完全不受影响**；没装则留在主屏（导出几秒）。
+            try:
+                import ctypes as _ct
+                _vsx = _ct.windll.user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+                _vsw = _ct.windll.user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+            except Exception:
+                _vsx, _vsw = 0, c.winfo_screenwidth()
+            _vright = _vsx + _vsw
+            pos_x = (_vright + 20 if _vright > c.winfo_screenwidth()
+                     else 0)
+            top.geometry(f"{new_w}x{new_h}+{pos_x}+40")
             top.update()
-            top.update()          # 二次 update：等工具栏收稳再量 rel 偏移
+            top.update()          # 二次 update：等布局收稳再量 rel 偏移
             rel_x = c.winfo_rootx() - top.winfo_rootx()
             rel_y = c.winfo_rooty() - top.winfo_rooty()
             vis_w = max(50, new_w - rel_x)
@@ -1137,22 +1188,43 @@ class TreeView:
                     x0, y0 = ci * vis_w, ri * vis_h
                     if on_progress:
                         on_progress(ri * n_cols + ci + 1)
-                    c.xview_moveto(min(x0 / total_w, 1.0))
-                    c.yview_moveto(min(y0 / total_h, 1.0))
+                    # 滚动 → 校验 → 重试（×view_moveto 偶发不生效，
+                    # 画布停在旧位置 ⇒ 瓦片内容错位 —— 实测全史档）
+                    for _try in range(3):
+                        c.xview_moveto(min(x0 / total_w, 1.0))
+                        c.yview_moveto(min(y0 / total_h, 1.0))
+                        c.update()
+                        if (abs(float(c.xview()[0]) * total_w - x0) < 4
+                                and abs(float(c.yview()[0]) * total_h - y0) < 4):
+                            break
+                    # ★ 渐进虚拟渲染（使用者裁定）：大谱一屏几千人，
+                    #   一拍画不完 —— 第一拍起反复泵事件循环，让 1ms 的
+                    #   续拍把这一屏**画完再截**（慢工出细活）。
                     self._paint_viewport()
-                    c.update(); c.update()
+                    for _ in range(240):
+                        c.update()
+                        if not getattr(self, "_paint_job", None):
+                            break
+                    c.update()
+
                     w_img, h_img, bgra = wincap.capture_widget(
                         c, prefer_printwindow=True)
                     img = Image.frombuffer(
                         "RGBA", (w_img, h_img), bgra, "raw", "BGRA").convert("RGB")
+                    # PrintWindow 连标题栏/边框一起画进缓冲 → 裁剪起点
+                    # 要加客户区在窗面里的偏移（差值 = 标题栏高，实测 45px）
+                    off_x, off_y = wincap.client_offset_in_window(c)
                     vis_w2, vis_h2 = wincap.real_visible_size(
-                        img, rel_x, rel_y, vis_w, vis_h)
-                    out = img.crop((rel_x, rel_y,
-                                    rel_x + min(vis_w2, total_w - x0),
-                                    rel_y + min(vis_h2, total_h - y0)))
+                        img, off_x + rel_x, off_y + rel_y, vis_w, vis_h)
+                    out = img.crop((off_x + rel_x, off_y + rel_y,
+                                    off_x + rel_x + min(vis_w2, total_w - x0),
+                                    off_y + rel_y + min(vis_h2, total_h - y0)))
                     fp = path_prefix + (".png" if n_cols * n_rows == 1 else
                                         f"_r{ri + 1}c{ci + 1}.png")
+                    os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
                     out.save(fp)
+                    if not os.path.exists(fp):
+                        raise RuntimeError(f"保存后文件消失：{fp}（可能被杀软拦截）")
                     files.append((fp, out.width, out.height))
         finally:
             self.master.export_chrome(False)

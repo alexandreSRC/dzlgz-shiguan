@@ -455,7 +455,7 @@ class Sidebar(tk.Frame):
                                     ("nohist", "隐藏非史"),
                                     ("dead", "隐藏逝者"),
                                     ("enrolled", "仅显入谱"),
-                                    ("focus", "仅显所选"),
+                                    ("focus", "仅显关注"),
                                     ("__locate__", None)],   # 占位：右下格
                              command=m.on_chip_toggle, size=10, pad=7, grid_cols=3)
         self.chips.pack(fill=tk.X, pady=(5, 0))
@@ -476,7 +476,8 @@ class Sidebar(tk.Frame):
                   "隐藏非史：**隐藏全部非史实人物**（取消勾选即全部恢复）。\n"
                   "隐藏逝者：隐藏已故人物（祖孙之间唯一在世的桥接节点会保留）。\n"
                   "仅显入谱：只画家谱里「点过入谱 / 加入族谱」的人（默认勾选）。\n"
-                  "仅显所选：只画右键「选定」的人及其男性后裔（可多选）。")
+                  "仅显关注：只画右键「关注」的人及其男性后裔（可多选）。\n"
+                  "（关注即入谱：被关注的人连同其父系后裔会自动写进谱牒。）")
 
         # === 人物信息 ===
         self.card_info = Card(self.inner, theme, "人物信息")

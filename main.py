@@ -17,6 +17,7 @@ import ctypes
 import logging
 import os
 import sys
+import time
 import tkinter as tk
 
 
@@ -178,6 +179,7 @@ class ShiguanApp:
         self.hide_dead = bool((self.cfg.get("filter_state") or {}).get("dead", False))
         self._branch_only = bool((self.cfg.get("filter_state") or {}).get("branch", False))
         self.focused = []                 # 选定名单（按谱牒存，见上）
+        self.unfocused = []               # ★ 取消关注名单（按谱牒存，见 storage.CANVAS_KEYS）
         self._focus_set_cache = None      # 高亮集合缓存（见 focus_set）
         self._focus_set_key = None        # 缓存对应的 people 身份（换档自动重算）
         self._enrolled_cache = None       # 「已入谱」集合缓存（见 enrolled_set）
@@ -422,10 +424,10 @@ class ShiguanApp:
             self.people = people
             self.cutoff_person = cutoff
             self._load_followed()          # 续谱名单跟着谱牒走（存在 source.watch）
-            self._load_canvas_state()      # ★ 选定名单 / 按支系隐藏名单也按谱牒走
+            self._load_canvas_state()      # ★ 关注名单 / 按支系隐藏名单也按谱牒走
             logger.info(f"谱牒档加载 {len(self.people)} 人 · "
                         f"续谱名单 {len(self.followed_codes())} 人 · "
-                        f"选定名单 {len(self.focused)} 人")
+                        f"关注名单 {len(self.focused)} 人")
             if model.normalize(self.people):
                 logger.info("谱牒数据迁移完成，已保存")
                 self.save_data()
@@ -449,6 +451,8 @@ class ShiguanApp:
         st = storage.load_canvas_state(self.current_save)
         self.focused = [n for n in (st.get("focused_people") or [])
                         if n in self.people]
+        self.unfocused = [n for n in (st.get("unfocused") or [])
+                          if n in self.people]
         self.hidden_non_historical = {n: True
                                       for n in (st.get("hidden_non_historical") or [])
                                       if n in self.people}
@@ -462,6 +466,7 @@ class ShiguanApp:
             storage.write_save(
                 self.current_save, self.people, self.cutoff_person,
                 canvas={"focused_people": list(self.focused),
+                        "unfocused": list(self.unfocused),
                         "hidden_non_historical": [k for k, v in
                                                   self.hidden_non_historical.items() if v]})
             import time
@@ -710,10 +715,25 @@ class ShiguanApp:
             slot = S.SaveSlot(path).load()
         except Exception as e:
             self.record_slot = None
+            # 卿室编号跟着槽走：槽没载进来就清空（卿族色退回启发式）
+            try:
+                from app import jue as JUE
+                JUE.install_qing_codes(())
+            except Exception:
+                pass
             logger.error(f"载入实录槽失败: {e}")
             return False
         self.record_slot = slot
         self.record_era = self._detect_era(slot)
+        # ★ 2026-10-02（C 批）：把**卿室家族成员**的编号集合注入 `app/jue.py`
+        #   —— 卿族的「卿」色从此走**存档实证**（家族总表的 `Jia_Zu_Type`），
+        #   不再只靠「世系名以氏结尾」的启发式。与国爵表同款：按槽刷新。
+        try:
+            from app import gongqing as GQ
+            from app import jue as JUE
+            JUE.install_qing_codes(GQ.qing_members(slot))
+        except Exception as e:
+            logger.warning(f"卿室编号注入失败（卿族色退回启发式）：{e}")
         self.record_rel = R.RelationGraph.build(slot)
         self.record_xref = XR.XRef.build(slot)
         # ★ 派生表在**这里**推 —— 不依赖「人物」页被打开。
@@ -721,6 +741,18 @@ class ShiguanApp:
         self.record_people, self.record_hist = self._derive(slot)
         self.record_derived = True
         self._attach_book_table()
+        # ★ 2026-10-02 修使用者报的「切了实录槽，人物页还是旧档的表」：
+        #   此前 `open_record` 只换 `app.record_slot`，**人物页视图仍握着旧槽**
+        #   （`attach()` 只在视图新建时跑过），要切一次页签才恢复。
+        #   现在载入成功后统一重挂；视图不在（启动早期 / 非人物页）就跳过。
+        #   ⚠️ 必须放在 `_attach_book_table()` **之后** —— 它往 `slot.tables` 里
+        #      挂了「谱牒总谱」，重挂时重建的导航才带得上这一行。
+        pv = getattr(self, "person_view", None)
+        if pv is not None and getattr(pv, "slot", None) is not slot:
+            try:
+                pv.attach(slot)
+            except Exception as e:
+                logger.warning(f"人物页重挂新实录槽失败（不影响其它页）：{e}")
         self.cfg = update_config(current_record=path)
         logger.info(f"实录槽载入：{slot.name} · {len(slot.tables)} 表族 · 剧本 {self.record_era}")
         return True
@@ -885,6 +917,9 @@ class ShiguanApp:
           `tools/import_from_game.detect_era` 各持一份，注释自认「改一处要改两处」。
           本方法只负责把 SaveSlot 的三张表读成行列表交给 `era_of`。
           关键认知（151 国阶段同时代并存、四级判据）见 era.py 模块头。
+        ★ 2026-10-02 修：第 3 条判据的「玩家国」原来硬编码 `King_Code == 0`
+          （实测 0 是**秦**，玩家是**楚**）—— 现在由世传表反查（见
+          `era.player_king_code`），不再猜。
         """
         from app import era as ERA
         if slot is None:
@@ -892,10 +927,13 @@ class ShiguanApp:
         wc = slot.table("Save_Wang_Chao_Data")
         rec = slot.table("Save_KingData/King_Stage_Record")
         kd = slot.table("Save_KingData")
+        sz = slot.table("Shi_Zhuan_Controller")
+        kd_rows = kd.rows if kd else []
         return ERA.era_of(
             wc.rows if wc else [],
             rec.rows if rec else [],
-            kd.rows if kd else [],
+            kd_rows,
+            ERA.player_king_code(sz.rows if sz else [], kd_rows),
         )
 
     def record_count(self):
@@ -1544,16 +1582,40 @@ class ShiguanApp:
                 self._hint_not_on_canvas(name)
 
     def export_chrome(self, hide):
-        """整块导出专用：收起/恢复侧栏（PanedWindow 面板，不销毁控件）。"""
+        """整块导出专用：收起/恢复**整套界面骨架**（侧栏 + 顶栏 + 工具栏），
+        让画布顶到窗口左上角 —— 导出图里不再混进任何界面元素。
+        PanedWindow.remove / pack_forget 都不销毁控件，导完原位恢复。
+        """
         pw, side = getattr(self, "pw", None), getattr(self, "side_host", None)
-        if pw is None or side is None:
-            return
         if hide:
-            if side.winfo_manager():
+            # ★ 2026-10-02 P1-2：hide 时记下每个控件的 pack_info()，
+            #   恢复按 info 原位重排 —— 不再靠「猜 main_area 里谁是容器」
+            #   （未来主区插新控件也不会恢复错位）。
+            self._chrome_hidden = []
+            if side is not None and side.winfo_manager():
                 pw.remove(side)
-        elif not side.winfo_manager():
-            pw.add(side, minsize=230, width=self.theme.sidebar_w,
-                   stretch="never")
+                self._chrome_hidden.append(("side_host", None))
+            for name in ("toolbar", "topbar"):
+                w = getattr(self, name, None)
+                if w is not None and w.winfo_manager():
+                    info = w.pack_info()
+                    w.pack_forget()
+                    self._chrome_hidden.append((name, info))
+        else:
+            for name, info in reversed(getattr(self, "_chrome_hidden", []) or []):
+                w = getattr(self, name, None)
+                if w is None:
+                    continue
+                if name == "side_host":
+                    # ★ before=main_area：add 默认追加到末尾（侧栏会跑到
+                    #   右侧去——使用者实测），必须放回主区之前。
+                    pw.add(side, minsize=230, width=self.theme.sidebar_w,
+                           stretch="never", before=self.main_area)
+                elif info:
+                    w.pack(**info)
+                else:
+                    w.pack(fill=tk.X)
+            self._chrome_hidden = []
 
     def locate_person(self):
         """家谱页侧栏「⌖ 定位人物」：把人居中并高亮闪一圈。
@@ -2058,10 +2120,10 @@ class ShiguanApp:
                 self.statusbar.set(
                     "hint", "尚无入谱者 —— 在人物页点「入谱」或「加入族谱」")
         if key == "focus":
-            # 「仅显所选」：勾选启用过滤（名单=右键选定的人），取消只停用、名单保留
+            # 「仅显关注」：勾选启用过滤（名单=右键关注的人），取消只停用、名单保留
             self.focus_only = value
             if value and not self.focused:
-                self.statusbar.set("hint", "尚未选定 —— 画布/表格右键「选定」")
+                self.statusbar.set("hint", "尚未关注 —— 画布/表格右键「关注」")
             if self.sidebar is not None and hasattr(self.sidebar, "set_focus_btn"):
                 self.sidebar.set_focus_btn(value)
         if self.tree is not None:
@@ -2106,35 +2168,47 @@ class ShiguanApp:
         self._refresh_all()
 
     def export_tree_image(self):
-        from tkinter import filedialog
+        """★ 2026-09-27 整块画布后台导出：不弹对话框、不动使用者屏幕。
+
+        把主窗口临时挪到屏幕外拉成超级大窗（等效虚拟显示器），
+        PrintWindow 让窗口自己渲染整面 —— 时间/代际两种画布都整块保存，
+        自动落到根目录「导出画布/」文件夹（文件名 = 谱名_模式_时间戳）。
+        """
         from app.widgets import msgbox as messagebox
         view = self.tree if self.tree is not None else self.timeline
         if view is None:
             return
-        who = "家谱(代际)" if self.tree is not None else "家谱(时间)"
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png", filetypes=[("PNG 图片", "*.png")],
-            initialfile=f"{self.current_save or '家谱'}_{who}.png",
-            title=f"导出{who}图片", parent=self.root)
-        if not path:
-            return
+        who = "代际" if self.tree is not None else "时间"
+        outdir = os.path.join("导出画布")   # 根目录下的默认画布文件夹
+        os.makedirs(outdir, exist_ok=True)
+        prefix = os.path.join(
+            outdir, f"{self.current_save or '家谱'}_{who}_"
+                    f"{time.strftime('%Y%m%d_%H%M%S')}")
         try:
-            # ★ 2026-09-27 使用者要求：导出**整块画布**（含没显示的部分，
-            #   代数标签/朝代带都在内），不再只截可视面板 —— 大画布自动
-            #   分块成多个文件（每块 ≤10000px，逐屏截取拼接）。
-            prefix = path[:-4] if path.lower().endswith(".png") else path
-            files = view.export_full(prefix, on_progress=lambda d: (
-                self.statusbar.set("hint", f"导出中… 已截 {d} 屏")))
-            if len(files) == 1:
-                f0, w0, h0 = files[0]
-                messagebox.showinfo(
-                    "导出成功", f"已导出整块画布 {w0}×{h0} 像素：\n{f0}")
+            if self.tree is not None:
+                # 代际：离线 PIL 渲染器 —— 不开窗口、不碰屏幕，任意大小
+                # 分块（大谱也稳，绕开实时窗口截屏的全部限制）
+                from tools.export_png import render_book
+                files = render_book(
+                    self.current_save or "未命名", outdir="导出画布",
+                    on_progress=lambda d, t: self.statusbar.set(
+                        "hint", f"后台导出中… {d}/{t} 块"))
             else:
-                inner = "\n".join(f"{f}（{w}×{h}）" for f, w, h in files[:12])
-                more = f"\n… 共 {len(files)} 个文件" if len(files) > 12 else ""
-                messagebox.showinfo(
-                    "导出成功",
-                    f"整块画布较大，已分 {len(files)} 个文件：\n{inner}{more}")
+                # ★ 2026-10-02 换成**离线 PIL 渲染器**（与代际同规）：
+                #   旧路（拉成超级大窗 + PrintWindow）在**单屏**机器上只能渲染到
+                #   屏幕宽，右侧全是纯黑（实测内容止于 x≈2560 = 屏宽，见日志九十八批）。
+                #   离线渲染完全不碰窗口/屏幕 ⇒ 任意尺寸、一张整图。
+                from tools.export_png import render_timeline
+                files = [render_timeline(
+                    self.current_save or "未命名", outdir="导出画布",
+                    plate=getattr(view, "plate", "v"),
+                    on_progress=lambda d, t: self.statusbar.set(
+                        "hint", f"后台导出中… {d}/{t} 块"))]
+            names = "、".join(os.path.basename(f) for f, _w, _h in files)
+            self.statusbar.set(
+                "hint", f"已后台保存 {len(files)} 个文件 → 导出画布/{names}")
+            logger.info(f"整块导出 {len(files)} 个文件 → "
+                        f"{os.path.abspath('导出画布')}")
         except Exception as e:
             logger.error(f"导出图片失败: {e}")
             messagebox.showerror("导出失败", f"导出图片失败：{e}")
@@ -2152,12 +2226,13 @@ class ShiguanApp:
         menu.add_command(label="修改尊号/谥号", command=lambda: self._edit_note(person))
         menu.add_command(label="编辑人物介绍", command=lambda: forms.bio_dialog(self, person))
         menu.add_separator()
-        # ★ 2026-09-23「仅显所选」：右键「选定」把此人加进名单（可连续多选），
-        #   再勾左侧「仅显所选」chip 只看名单人 + 其后裔。
+        # ★ 2026-09-23「仅显所选」→ 2026-10-02 使用者改名「关注」：
+        #   右键「关注」把此人加进名单（可连续多选），再勾左侧「仅显关注」chip
+        #   只看名单人 + 其后裔；**关注即自动入谱**（连同父系后裔，见 _enroll_branch）。
         if person in self.focused:
-            menu.add_command(label="✓ 已选定（再点取消）", command=lambda: self.toggle_focus(person))
+            menu.add_command(label="✓ 已关注（再点取消）", command=lambda: self.toggle_focus(person))
         else:
-            menu.add_command(label="选定（仅显所选）", command=lambda: self.toggle_focus(person))
+            menu.add_command(label="关注（仅显关注）", command=lambda: self.toggle_focus(person))
         menu.add_separator()
         # ★ 桥：查档（谱牒 → 实录）
         menu.add_command(label="⌖ 查档（跳到实录层）", command=lambda: self.open_viewer(person))
@@ -2212,38 +2287,99 @@ class ShiguanApp:
             self._focus_set_cache = out
         return self._focus_set_cache
 
-    def toggle_focus(self, person):
-        """右键「选定/取消选定」：把某人加进/移出「仅显所选」名单（可多选）。"""
+    def _paternal_branch(self, person):
+        """此人 + 其**全部父系男性后裔**（谱牒层名字集；与 `focus_set` 同一口径）。"""
+        if person not in self.people:
+            return set()
+        kids = {}
+        for n, v in self.people.items():
+            d = (v or {}).get("father", "") or ""
+            if d:
+                kids.setdefault(d, []).append(n)
+        out = {person}
+        stack = [person]
+        while stack:
+            cur = stack.pop()
+            for c in kids.get(cur, ()):
+                if c not in out:
+                    out.add(c)
+                    stack.append(c)
+        return out
+
+    def _enroll_branch(self, person, code=""):
+        """★ 2026-10-02「关注即入谱」：把此人连同其父系男性后裔写进谱牒、打「入谱」标。
+
+        使用者原话：「被关注人物自动入谱，他的后裔也自动入谱」。
+          · 谱牒层的人：本就在档里，只补「入谱」标（不跑导入器，即时）；
+          · 实录层的人：先走导入器写档（与「立即入谱」同一条路，导入器自带
+            父系后裔链），成功后再补标整支。
+        返回 `(补标人数, 说明语)` —— 说明语非空时用于状态栏。
+        """
+        if person not in self.people:
+            if not code:
+                return 0, "实录层人物 · 未带编号，需先入谱才上画布"
+            if not self.push_to_book(code, person):
+                return 0, "入谱失败，仅记入关注名单"
+        n = 0
+        for nm in self._paternal_branch(person):
+            v = self.people.get(nm) or {}
+            if v and not v.get("enrolled"):
+                v["enrolled"] = True
+                n += 1
+        if n:
+            self.save_data()
+            self._enrolled_cache = None
+        return n, ""
+
+    def toggle_focus(self, person, code=""):
+        """右键「关注/取消关注」：把某人加进/移出「仅显关注」名单（可多选）。
+
+        ★ 2026-10-02 使用者改名：选定 → 关注；**关注即入谱**（人 + 父系后裔，
+          见 `_enroll_branch`）。取消关注**不撤**入谱标 —— 人已进档，
+          撤标会让整支从画布上消失（要撤走请用谱牒侧的删除）。
+        """
         if person not in self.people:
             # ★ 2026-09-26 二改（使用者报「我的选中功能没有了吗」）：实录层的
-            #   人物也照选。原口径（09-23）对未入谱的人弹窗拦下 —— 在人物页对
-            #   实录层的人点「选定」就像按钮坏了。现在照加名单：「仅显所选」
-            #   在人物页按名字过滤照常可用；画布只画谱牒，实录层的人入谱后
-            #   自然出现（提示语说明）。
+            #   人物也照选；★ 2026-10-02 起改为**关注即入谱**（带编号的先写档）。
             if person in self.focused:
                 self.focused.remove(person)
+                if person not in self.unfocused:
+                    self.unfocused.append(person)   # 记忆取消，自动关注不再回加
                 self.statusbar.set("hint",
-                    f"已取消选定 {person}（余 {len(self.focused)} 人）")
+                    f"已取消关注 {person}（余 {len(self.focused)} 人）")
+                self._persist_canvas_state()
             else:
-                self.focused.append(person)
+                # ⚠️ 顺序要紧：**先**写档、**后**落名单。
+                #   实测踩过：实录层写档走 `push_to_book` → `load_data()`，
+                #   而 `load_data` 会把关注名单**从谱牒里重新读回来** ——
+                #   先 append 的话，刚加的名字当场被覆盖（名单数不动，像没生效）。
+                got, why = self._enroll_branch(person, code)
+                if person not in self.focused:
+                    self.focused.append(person)
+                if person in self.unfocused:
+                    self.unfocused.remove(person)   # 重新关注 → 撤销取消记忆
+                tail = f"已自动入谱 {got} 人" if got else (why or "未带编号")
                 self.statusbar.set(
-                    "hint", f"已选定 {person}（实录层人物 · 共 "
-                            f"{len(self.focused)} 人；画布需先入谱才显示）")
+                    "hint", f"已关注 {person}（实录层 · 共 {len(self.focused)} 人"
+                            f"；{tail}）")
+                self._persist_canvas_state()
             self._focus_set_cache = None   # 名单变了，高亮集合缓存必须重算
             return
         if person in self.focused:
             self.focused.remove(person)
-            self.statusbar.set("hint", f"已取消选定 {person}（余 {len(self.focused)} 人）")
+            if person not in self.unfocused:
+                self.unfocused.append(person)   # 记忆取消，自动关注不再回加
+            self.statusbar.set("hint", f"已取消关注 {person}（余 {len(self.focused)} 人）")
         else:
-            self.focused.append(person)
-            # ★ 2026-09-23：若此人没入谱、而「仅显入谱」又勾着，光看画布会以为
-            #   没选上（其实是被那层默认过滤挡了）。这里明说一句，避免反复点。
-            extra = ""
-            if (self.enrolled_only
-                    and person not in self.enrolled_set()):
-                extra = "；此人未入谱，画布上只显示他本人（其父系谱系需先入谱）"
+            got, why = self._enroll_branch(person, code)   # 先入谱
+            if person not in self.focused:                 # 再落名单（同上，防被重载覆盖）
+                self.focused.append(person)
+            if person in self.unfocused:
+                self.unfocused.remove(person)              # 重新关注 → 撤销取消记忆
+            extra = f"；已自动入谱 {got} 人" if got else ""
             self.statusbar.set(
-                "hint", f"已选定 {person}（共 {len(self.focused)} 人；勾「仅显所选」生效）{extra}")
+                "hint", f"已关注 {person}（共 {len(self.focused)} 人"
+                        f"；勾「仅显关注」生效）{extra}")
         self._focus_set_cache = None      # 名单变了 → 高亮集合重算
         self._persist_canvas_state()      # ★ 名单按谱牒存（原来写 config 会串档）
         if self.focus_only:
@@ -2264,6 +2400,167 @@ class ShiguanApp:
                 if _idx is not None:
                     pv._show_detail(_idx)
         self._persist_filter_state()
+
+    # ================================================================ 公卿家族（B 批）
+    def gongqing_clans(self):
+        """当前实录槽里的**公卿家族**（公室 / 宗室 / 卿室 · 中夏 · 非叛军）。
+
+        判据唯一实现在 `app/gongqing.py`（见模块头三层过滤）；本方法只把槽递进去。
+        """
+        from app import gongqing as GQ
+        return GQ.clans(self.record_slot) if self.record_slot is not None else []
+
+    def _nearest_common_ancestor(self, names_a, names_b, max_up=3):
+        """两组人各自的**父系链**（本人 + 往上最多 `max_up` 代）里最近的共祖。
+
+        ★ 2026-10-02（B 批）使用者：「公卿家族自动关注，如果有某两个家族同宗，
+          **最近的共祖**如果没加关注，则加关注」。
+        判据只能走**谱牒父子链** —— 游戏的家族关系表（`Jia_Zu_Guan_Xi_Map`）
+        本档没有同姓/姻亲内容，用不了（见 `gongqing` 模块头）。
+        返回 `(共祖名, 代距和)`；找不到返回 `(None, None)`。
+        """
+        def chain(nm):
+            out, cur = [], nm
+            for d in range(max_up + 1):
+                if not cur or cur not in self.people:
+                    break
+                out.append((cur, d))
+                cur = (self.people.get(cur) or {}).get("father") or ""
+            return dict(out)      # {名字: 上溯代距}
+
+        best, best_d = None, None
+        for a in names_a:
+            ca = chain(a)
+            if not ca:
+                continue
+            for b in names_b:
+                cb = chain(b)
+                for nm, da in ca.items():
+                    db = cb.get(nm)
+                    if db is None:
+                        continue
+                    if best_d is None or da + db < best_d:
+                        best, best_d = nm, da + db
+        return best, best_d
+
+    def focus_gongqing(self, quiet=False, slot_path=""):
+        """**公卿家族自动关注**（＝自动入谱）—— 续谱后自动跑，也可手动补跑。
+
+        ★ 2026-10-02（B 批）使用者：「公卿家族自动关注，如果有某两个家族同宗，
+          最近的共祖如果没加关注，则加关注」。
+
+        做法（与「关注即入谱」同一套语义，只是**批量**走）：
+          1. 取公卿家族全部成员编号（本档 21 家 / 140 人）；
+          2. 每个成员连同其**父系男性后裔**一起算（与 `_male_line` / 关注同口径）；
+          3. **一次**调用导入器 `import_codes` 批量写进谱牒（不是逐个 push_to_book
+             —— 那样每人都要读写一遍整本谱牒，140 遍会慢到不可用）；
+          4. 家族成员进「关注」名单、连同其父系后裔打「入谱」标（各落盘一次）；
+          5. 同宗（同姓同氏）的两家，按谱牒父子链回溯最多 3 代找**最近共祖**，
+             共祖若没关注就一并关注。
+
+        `quiet=True`（续谱后自动调用）只返回一句话、不碰状态栏；
+        `slot_path` 给了就与判据同源（防「按 A 槽判族、去 B 槽导人」）。
+        """
+        from app import gongqing as GQ
+        from tools import import_from_game as IM
+
+        def _say(msg):
+            if not quiet:
+                try:
+                    self.statusbar.set("hint", f"公卿自动关注：{msg}")
+                except Exception:
+                    pass
+            return msg
+
+        if not self.current_save:
+            return _say("尚未载入谱牒档")
+        src = slot_path or (self.record_slot.root
+                            if self.record_slot is not None else "")
+        if not src:
+            return _say("尚未载入实录槽")
+        if self.record_slot is None or self.record_slot.root != os.path.abspath(src):
+            # 判据（家族表）与导入（四表）必须读**同一个槽**，否则封号对不上人
+            if not self.open_record(src):
+                return _say("实录槽载入失败，跳过")
+        fams = GQ.clans(self.record_slot)
+        if not fams:
+            return _say("这个存档里没有可识别的公卿家族（需中夏诸国的公室/宗室/卿室）")
+
+        by_code = IM.load_tables(src)
+        roots = set()
+        for f in fams:
+            roots |= set(f["members"])
+        # ★ 2026-10-03 使用者：「公卿自动关注，但要能取消关注、取消了记忆取消」。
+        #   取消关注的人（记在 self.unfocused，按谱牒存）不再被自动关注/入谱。
+        code2name = {str((v or {}).get("code") or ""): nm
+                     for nm, v in self.people.items() if (v or {}).get("code")}
+        roots = {c for c in roots
+                 if code2name.get(str(c)) not in self.unfocused}
+        need = set()
+        for c in roots:
+            if c in by_code:
+                need |= set(IM._male_line(by_code, c))
+        if not need:
+            return _say("公卿家族没有可在存档里对上的人")
+
+        rc, _a, _u = IM.import_codes(src, sorted(need), self.current_save,
+                                     by_code=by_code)
+        if rc != 0:
+            logger.warning("公卿自动关注：批量入谱失败")
+            return _say("入谱失败（明细见 shiguan.log）")
+        self.load_data()
+
+        # 家族成员 → 关注名单；本人 + 父系后裔 → 「入谱」标（同一次落盘）
+        added, focused_add = 0, 0
+        for nm, v in self.people.items():
+            c = str((v or {}).get("code") or "")
+            if c not in need:
+                continue
+            if not v.get("enrolled"):
+                v["enrolled"] = True
+                added += 1
+            if c in roots and nm not in self.focused:
+                self.focused.append(nm)
+                focused_add += 1
+        if added or focused_add:
+            self.save_data()
+            self._enrolled_cache = None
+            self._focus_set_cache = None
+
+        # 同宗共祖：两家同姓同氏 ⇒ 谱牒父子链 ≤3 代找最近共祖
+        kin = 0
+        for a, b in GQ.same_clan_pairs(fams):
+            na, nb = self._names_of_codes(a["members"]), self._names_of_codes(b["members"])
+            if not (na and nb):
+                continue
+            anc, _d = self._nearest_common_ancestor(na, nb)
+            if anc and anc not in self.focused and anc in self.people:
+                self.focused.append(anc)
+                if not (self.people.get(anc) or {}).get("enrolled"):
+                    self.people[anc]["enrolled"] = True
+                    added += 1
+                kin += 1
+        if kin:
+            self.save_data()
+            self._enrolled_cache = None
+            self._focus_set_cache = None
+
+        self._refresh_all()
+        msg = (f"{len(fams)} 家 · 入谱 {len(need)} 人"
+               + (f"（谱内已标 {added} 人）" if added else "")
+               + (f" · 关注新增 {focused_add} 人" if focused_add else ""))
+        if kin:
+            msg += f" · 同宗共祖 {kin} 人"
+        logger.info("公卿自动关注：" + msg)
+        if not quiet:
+            return _say(msg + "　勾「仅显关注」即只看这一批")
+        return msg
+
+    def _names_of_codes(self, codes):
+        """编号集合 → 谱牒里的名字（只回谱内有的）。"""
+        cs = {str(c) for c in (codes or ())}
+        return [n for n, v in self.people.items()
+                if str((v or {}).get("code") or "") in cs]
 
     def _edit_note(self, person):
         from tkinter import simpledialog
@@ -2853,8 +3150,10 @@ class ShiguanApp:
             manual = storage.sanitize_name(manual)
         name, scen, mode = self.slot_book_name(slot_path)
         if manual:
-            exists = os.path.exists(storage.save_path(manual))
-            if not exists:
+            # ★ 2026-10-01：判据从「档在不在」改成「**档里有没有人**」——
+            #   空壳档（46 字节的 `{"people": {}}`）也算「在」，会被误判成
+            #   可续写的已有谱牒，续谱一跑就撞「谱牒档不存在或还没有人」。
+            if not storage.book_has_people(manual):
                 return {"action": "new", "name": manual, "scen": scen, "mode": mode,
                         "note": f"手动指定：新建《{manual}》"}
             if storage.is_protected(manual) and not force_new:
@@ -2873,7 +3172,8 @@ class ShiguanApp:
                     "note": f"《{owner}》是你的手写原始记录（保护档），自动续谱跳过它。"
                             "（点「① 先演习」可以先拉档看报告；要真写就先取消它的保护，"
                             "或勾「手动指定目标谱牒」换一部）"}
-        if not os.path.exists(storage.save_path(name)):
+        # 同上：空壳档按「新建」处理，别让它冒充成可续写的旧谱
+        if not storage.book_has_people(name):
             return {"action": "new", "name": name, "scen": scen, "mode": mode,
                     "note": f"将自动新建《{name}》"}
         if force_new:
@@ -2913,20 +3213,25 @@ class ShiguanApp:
     def extend_options(self, name=""):
         """续谱的抽取口径 —— **继承谱牒建档时的口径**（source.prune）。
 
-        必须继承：秦末档建档用的是 hist（3233 人），若续谱用默认 anon，
-        新抽会变成 9000+ 人，凭空多出几千个不相干的人物。
-        没有或不合法就退回 hist（只收史实，最保守）。
+        ★ 2026-10-03 使用者裁定（口径变更，务必照此）：
+          「所有史实人物的后裔，包括后裔的后裔，**不论史实还是非史**，
+            每次续谱都更新；我加了关注的非史始祖，后裔也更新。」
+          ⇒ 入谱口径 = **`hist-line`**：史实 + 其全部父系后裔链 ∪ 点名者及其后裔。
+          老档记的 `hist`（只收史实）**自动升级**为 `hist-line`
+          —— 否则非史实后裔永远进不来（使用者报的「读了几个档，非史实后裔都没更新」）。
 
         `name` 缺省用当前谱牒；自动续谱写到**别的**谱牒时传目标名，
-        否则会拿错口径（新建的谱牒没有 source，会退回 hist，正好是对的）。
+        否则会拿错口径（新建的谱牒没有 source，退回 hist-line，正好是对的）。
         """
         try:
             src = storage.load_source(name or self.current_save) or {}
         except Exception:
             src = {}
         prune = str(src.get("prune") or "")
-        if prune not in ("none", "male-son", "anon", "hist"):
-            prune = "hist"
+        if prune == "hist":                 # 老档升级：只收史实 → 史实+全后裔
+            prune = "hist-line"
+        if prune not in ("none", "male-son", "anon", "hist", "hist-line"):
+            prune = "hist-line"
         return prune, bool(src.get("real_state_only", True))
 
     def run_extend(self, apply=False, prune="", pull_slot="", log=None,
@@ -3106,6 +3411,17 @@ class ShiguanApp:
                 self._record(("自动续谱（整档新建）：%s 人" % add) if create
                              else f"自动续谱：新增 {add} 更新 {upd}")
                 self._refresh_all()
+            # ★ 2026-10-02（B 批）使用者：「公卿家族自动关注」——
+            #   续谱完自动跑一遍（公室/宗室/卿室三家类型 · 中夏 · 非叛军），
+            #   连同同宗共祖一起进「关注」名单并自动入谱。
+            #   ⚠️ 必须放在**切谱牒之后**（`switch_save` 会换掉 current_save），
+            #      并显式传这次续谱用的槽 —— 免得判族与导人取自两个存档。
+            say("── 公卿家族自动关注（公室 / 宗室 / 卿室）──")
+            try:
+                say(self.focus_gongqing(quiet=True, slot_path=slot))
+            except Exception as e:
+                logger.warning(f"公卿自动关注跳过：{e}")
+                say(f"（公卿自动关注跳过：{e}）")
             step(5, "完成")
         return True, out
 

@@ -20,6 +20,7 @@ from tkinter import filedialog, ttk
 
 from .. import catalog as C
 from .. import dpi as _dpi
+from .. import gongqing as GQ
 from .. import labels as L
 from .. import profiles as PF
 from .. import record_derive as RD
@@ -129,9 +130,16 @@ class PersonView:
     #   原先那个「奇数补空格子」也随之消失。
     #   原先拆两行是因为三个挤一行放不下（侧栏 288px）—— 现在一行仍是 2 格，不变。
     FILTER_SINGLES = (("civil", "隐藏平民"), ("born", "出生记录"),
-                      ("book", "已入谱牒"), ("watch", "续谱名单"))
+                      ("book", "已入谱牒"), ("watch", "续谱名单"),
+                      ("gongqing", "仅显公卿"))
     FILTER_SINGLE_ROWS = ((("civil", "隐藏平民"), ("born", "出生记录")),
-                          (("book", "已入谱牒"), ("watch", "续谱名单")))
+                          (("book", "已入谱牒"), ("watch", "续谱名单")),
+                          # ★ 2026-10-02（A 批）使用者要求「在人物页面左侧菜单栏的
+                          #   筛选里面加入**仅显公卿**（包括公室 宗室 卿室三者）」。
+                          #   与上面四格同一张等宽两列表格（`_build_sidebar` 会把
+                          #   它们展平成一张 2 列网格，末行奇数时补空格），
+                          #   所以它单占一行左格、右格留白 —— 尺子仍是同一把。
+                          (("gongqing", "仅显公卿"),))
     # ★ 2026-09-28 使用者要求：「丁」从上面那张网格**搬进「男性等级」组**
     #   （截图圈的就是它，原先单占末尾一格、右边空着）。名字保持一个字，
     #   判据不动 —— 依然是**年龄 ≥ 15 的成丁**（见 FILTER_LEVELS 与 _pass_filter）。
@@ -167,6 +175,9 @@ class PersonView:
         #   与其它单选项「勾上后剩这些」的语义一致。这个键由 `_filter_ctx`
         #   直接补进 `_stats`（`people_stats` 不认识这个维度）。
         "civil": "非平民",
+        # ★ 2026-10-02（A 批）：公卿家族成员数（勾上后剩这些）——同「隐藏平民」，
+        #   由 `_filter_ctx` 直接补进 `_stats`。
+        "gongqing": "公卿",
         "ding": "丁",
     }
 
@@ -237,7 +248,12 @@ class PersonView:
         if not app.open_record(path):
             self.set_status("这个实录槽读不了（可能是云端加密档）", warn=True)
             return
-        self.attach(app.record_slot)
+        # ★ 2026-10-02：`app.open_record()` 载入成功后会**自己**把本视图重挂到新槽
+        #   （见 main.open_record）；但这条兜底路径本身就可能发生在「app 还没持有
+        #   本视图」时（脚本里单独 new 一个 PersonView）—— 那时 app 那边挂不到，
+        #   这里补一次。正常启动路径下 `self.slot` 已是新槽，不会重复挂。
+        if self.slot is not app.record_slot:
+            self.attach(app.record_slot)
 
     def attach(self, slot):
         """把主控制器载好的实录槽接进来。
@@ -552,7 +568,7 @@ class PersonView:
         #   等级组）。实测点「全选」会得到 **0 行**：出生记录 / 已入谱牒 /
         #   续谱名单三个「只留」型同时勾上就是三重交集，人可能一个不剩 ——
         #   这与「全选 = 什么都不限」完全矛盾。隐藏平民（勾上即收窄）同理。
-        for key in ("born", "book", "watch", "civil"):
+        for key in ("born", "book", "watch", "civil", "gongqing"):
             row = self.chips.get(key)
             if row is not None:
                 row.set_state(key, False)
@@ -610,6 +626,11 @@ class PersonView:
         #   （「丁」的判定已并到上面的等级组 —— 2026-09-28 搬组时一起挪。）
         if self._filter_on("civil") and code not in self._non_civil_codes:
             return False
+        # ★ 2026-10-02（A 批）「仅显公卿」：只留**公卿家族成员**
+        #   （公室 / 宗室 / 卿室 · 中夏 · 非叛军 —— 见 app/gongqing.py）。
+        #   与「隐藏平民」同规：勾上即收窄，整组不勾＝不限。
+        if self._filter_on("gongqing") and code not in self._gq_codes:
+            return False
         return True
 
     def _filter_ctx(self):
@@ -662,6 +683,14 @@ class PersonView:
                                 if v.get("code")}
         except Exception:
             self._book_codes = set()
+        # ★ 2026-10-02（A 批）：**公卿家族成员编号集合**（公室 / 宗室 / 卿室 ·
+        #   中夏 · 非叛军）。判据在 `app/gongqing.py`，**实时从实录槽算、不写档**
+        #   —— 免得动续谱的合并口径；没有实录槽（纯手写谱）时是空集，
+        #   「卿」标记与「仅显公卿」自然都不出现（宁缺勿猜）。
+        try:
+            self._gq_codes = GQ.clan_members(self.slot)
+        except Exception:
+            self._gq_codes = set()
         # ★ 2026-09-25：**计数与「隐藏平民」的口径必须跟着当前表走**。
         #   总谱（《全史存档》那一万多人）与实录槽是两批人 ——
         #   原来一律按实录槽算，于是总谱上显示「共 11874 人」（实录槽），
@@ -676,6 +705,9 @@ class PersonView:
             # 勾上只剩两边都有的人 —— 数字 1776 与结果 158 对不上的那种错）。
             self._non_civil_codes = {str(r.get("Ren_Code") or "")
                                      for r in bt.rows if PF.identity_of(r)}
+            # 「仅显公卿」的计数同样按**这张表**的行算（与上一条同规）。
+            self._stats["公卿"] = sum(1 for r in bt.rows
+                                     if str(r.get("Ren_Code") or "") in self._gq_codes)
         else:
             # 计数只在换槽 / 换名单 / 换表时算一次 —— 每敲一个字都重算不值当
             self._stats = RD.people_stats(self.slot, self._book_codes,
@@ -693,6 +725,8 @@ class PersonView:
             #   （`_refresh_filter_counts`）不必为这一项开特例。
             if isinstance(self._stats, dict):
                 self._stats["非平民"] = len(self._non_civil_codes)
+                # ★ 2026-10-02（A 批）「仅显公卿」计数同上（按实录槽这批人算）。
+                self._stats["公卿"] = len(self._gq_codes)
         self._ctx_family = self.cur_family
 
     def _refresh_filter_counts(self):
@@ -741,6 +775,13 @@ class PersonView:
             ("名单", [
                 ("follow", "加入族谱", self._toggle_follow_current, "edit",
                  "把当前人物加入自动续谱名单（续谱时连同其纯父系后裔一起抽取）"),
+                # ★ 2026-10-02（B 批）使用者：「公卿家族自动关注，最近的共祖
+                #   如果没加关注，则加关注」—— 续谱后会自动跑一遍，这里是
+                #   **手动补跑**入口（换挡/拉了新档之后想立刻补一次就点它）。
+                ("gq", "关注公卿", self.app.focus_gongqing, "edit",
+                 "把公卿家族（公室 / 宗室 / 卿室 · 中夏 · 非叛军）的成员全部\n"
+                 "关注并自动入谱，连同他们的父系后裔；同宗两家的最近共祖也一并关注。\n"
+                 "续谱后会自动执行一次，这个按钮用于手动补跑。"),
             ]),
             ("表格", [
                 ("fold", "展开全部", self._expand_all, "tool", "展开表格全部折叠的分组"),
@@ -857,11 +898,24 @@ class PersonView:
 
     # ---------------------------------------------------------------- 载入
     def _reload(self):
-        if self.slot:
-            p = self.slot.root
-            self.slot = None
-            if self.app.open_record(p):
-                self.attach(self.app.record_slot)
+        """工具栏「重新载入」：重读当前实录槽（本机缓存那份）。
+
+        ★ 2026-10-02：重挂改由 `app.open_record()` 统一负责（载入成功后它把本视图
+          接到新槽上）—— 原来这里再 `attach()` 一遍，导航与现场要白跑两趟。
+          读不了时把**旧槽**接回去，页面不至于空掉。
+        """
+        if not self.slot:
+            return
+        old = self.slot
+        p = old.root
+        self.slot = None
+        if not self.app.open_record(p):
+            self.set_status("重新载入失败：这个实录槽读不了", warn=True)
+            self.attach(old)
+            return
+        # 同上：app 没持有本视图时（孤立 new）补挂一次；正常路径下已是新槽。
+        if self.slot is not self.app.record_slot:
+            self.attach(self.app.record_slot)
 
     def _progress(self, done, total, name):
         if done % 40 == 0 or done == total:
@@ -965,8 +1019,18 @@ class PersonView:
             return
         name = self._nav_index.get(sel[0])
         if name:
+            # ★ 2026-10-02 使用者报「点一下加入关注，人物页面的表格自动排序一次，
+            #   不想每次点关注都重新排序」—— 真因就在这一行：
+            #   「入谱 / 关注」会走 `load_data()` → 重挂「谱牒总谱」→
+            #   `_rebuild_nav_after_book` 重建导航并 `nav.selection_set(当前表族)`，
+            #   于是 `<<TreeviewSelect>>` 触发本函数、把 `sort_key` 清成 None，
+            #   表格当场跳回默认「智略 降序」。
+            #   修法：**同一个表族被重新选中时不回到默认排序**（只是重画一遍，
+            #   好让新入谱/新关注的人拿到底色与「关注」紫标）。换表族才回默认。
+            same = (name == self.cur_family)
             self.cur_family = name
-            self.sort_key = None
+            if not same:
+                self.sort_key = None
             t = self.slot.tables[name]
             lbl, hint = split_hint(t.label or C.label_of_family(name))
             tail = "" if name in (t.label or "") else f"　·　表名 {name}"
@@ -1170,7 +1234,16 @@ class PersonView:
             if p is None:
                 p = PF.Profile(code, row, self.xref, PersonView._era)
             keymap = {zhname: k for zhname, k in PF.PROFILE_ORDER}
-            return p.value_of(keymap.get(zh, ""))
+            v = p.value_of(keymap.get(zh, ""))
+            # ★ 2026-10-02（A 批）使用者：「人物页面的表格中不是有区分主公 官员
+            #   平民吗，**加个卿字**，作为这些人的标记」——
+            #   身份列在「主 / 谥 / 官」全无时，若此人是**公卿家族成员**
+            #   （公室/宗室/卿室 · 中夏 · 非叛军，见 app/gongqing.py）就写「卿」。
+            #   即 **官/谥优先、卿垫底**，同格仍只 1 个字。
+            if zh == "身份" and not str(v or "").strip() \
+                    and str(code) in getattr(self, "_gq_codes", ()):
+                return "卿"
+            return v
         return None
 
     def _apply_filter(self):
@@ -1549,7 +1622,7 @@ class PersonView:
             self._show_detail(_i)
 
     def _on_row_right(self, event):
-        """右键表格行：弹菜单 —— 主项是「选定（仅显所选）」（匹配谱牒人名）。"""
+        """右键表格行：弹菜单 —— 主项是「关注（仅显关注）」（匹配谱牒人名）。"""
         iid = self.table.identify_row(event.y)
         if not iid:
             return
@@ -1571,10 +1644,10 @@ class PersonView:
                        activebackground=t.accent_soft, activeforeground=t.accent)
         if name in getattr(self.app, "people", {}):
             if name in getattr(self.app, "focused", []):
-                menu.add_command(label="✓ 已选定（再点取消）",
+                menu.add_command(label="✓ 已关注（再点取消）",
                                  command=lambda: self.app.toggle_focus(name))
             else:
-                menu.add_command(label="选定（仅显所选）",
+                menu.add_command(label="关注（仅显关注）",
                                  command=lambda: self.app.toggle_focus(name))
         else:
             menu.add_command(label=f"「{name}」不在当前谱牒里", state="disabled")
@@ -1698,31 +1771,36 @@ class PersonView:
         W_CELL = max(1, _dpi.px(560) // GC)     # 单列宽（写死）
         W_VAL = W_CELL * 2 - _dpi.px(6)         # 值列（跨 2 列）可用宽
         R = 0                                    # 行游标
-        b_push = self._mini_act(
-            gh, "立即入谱",
-            lambda c=code, n=str(getattr(p, "name", "") or ""):
-                self.app.push_to_book(c, n), primary=True,
-            col=0, row=R, span=2)
-        Tooltip(b_push, "把这位连同其全部男性后裔**立刻**写进当前谱牒档，\n"
-                        "写完家谱页 / 画布马上就能看到（不弹确认框）。")
-        followed = code in self.followed
-        b_fol = self._mini_act(gh, "已预约" if followed else "预约入谱",
-                               lambda c=code: self.toggle_follow(c),
-                               col=2, row=R, span=2)
-        Tooltip(b_fol, "**不马上写谱**：先把他这一支记进「续谱名单」，\n"
-                       "等下次点「续谱」时才连同父系后裔一起抽进谱。")
-        # ★ 2026-09-26 使用者问「选定按钮在哪里」：实录层详情卡此前**没有**
-        #   「选定」按钮（那行按钮只长在谱牒总谱卡上）—— 现在补上。
+        # ══════════ 2026-10-02 使用者裁定：撤「立即入谱」、改「加入续谱」 ══════════
+        # 他的三段论（成立）：①史实人物续谱时本就全量抽进谱牒 ⇒ 用不着「立即入谱」；
+        #   ②非史实人物要靠「加入续谱」（记进续谱名单）才能长期收；
+        #   ③「关注」现在 = 入谱 + 关注名单，已经是「立即入谱」的**超集**。
+        # ⇒ 撤掉「立即入谱」；「预约入谱」改名「加入续谱」（只对非史实开放）；
+        #   两粒按钮点击后都**自动把此人加入关注**（使用者要求）。
         _nm = str(getattr(p, "name", "") or "")
         _on = _nm in set(self.app.focused)
-        b_foc = self._mini_act(gh, "已选定" if _on else "选定人物",
-                               lambda: self._toggle_focus_card(_nm, b_foc),
-                               primary=_on, col=4, row=R, span=2)
-        Tooltip(b_foc, "加进「仅显所选」名单（可多选）：人物页按名单过滤，\n"
-                       "画布上的谱系同步高亮（实录层人物需入谱后才上画布）。")
-        # ★ 标题行里的「定位到表格」要跟它**左沿重合、等宽** —— 把它记下来给
-        #   `_sync_title_row()` 量宽度（它的宽度受 6 列网格影响，只能实测）。
-        self._last_act_btn = b_foc
+        b_foc = self._mini_act(gh, "已关注" if _on else "关注人物",
+                               lambda: self._toggle_focus_card(_nm, b_foc, code),
+                               primary=_on, col=0, row=R, span=4)
+        Tooltip(b_foc, "加进「仅显关注」名单（可多选）：人物页按名单过滤，\n"
+                       "画布上的谱系同步高亮。\n"
+                       "★ 关注即入谱 —— 他连同其父系男性后裔会自动写进谱牒、上画布。\n"
+                       "（原来那颗「立即入谱」已被它吸收，故撤下。）")
+        followed = code in self.followed
+        b_fol = self._mini_act(gh, "已加入" if followed else "加入续谱",
+                               lambda c=code, n=_nm: self._join_watch(c, n),
+                               col=4, row=R, span=2)
+        Tooltip(b_fol, "记进「续谱名单」：**以后每次续谱**都会把他这一支\n"
+                       "（连同那时候新出生的父系后裔）一起收进来。\n"
+                       "· 只对**非史实人物**开放 —— 史实人物续谱时自会全量收入，不必预约。\n"
+                       "· 点它也会自动把此人加入「关注」。")
+        if p.historical:
+            b_fol.set_enabled(False)      # 史实人物：置灰不可点（原因见悬停）
+        # ★ 标题行里的「定位到表格」要跟**最右那粒**左沿重合、等宽 —— 记下来给
+        #   `_sync_title_row()` 量宽度（宽度受 6 列网格影响，只能实测）。
+        #   ⚠️ 仍指**最右侧**按钮（旧布局里它就在 col4/span2）——
+        #      几何保持不变，「定位到表格」的对齐就不会被本次改动带偏。
+        self._last_act_btn = b_fol
         # ★ 2026-09-28 删除「◈ 关系」按钮 —— 关系已并进右栏，不必再切页去看。
         R += 1
         # ⚠️ 2026-09-28 撤回：上一轮把「定位到表格」搬到卡片网格里占了一整行 ——
@@ -1968,8 +2046,27 @@ class PersonView:
             else:
                 nb.grid(row=row, column=col + 3, sticky="w", padx=(6, 0))
 
-    def _toggle_focus_card(self, nm, btn):
-        """详情卡上的「选定人物」：切换名单并原位刷新按钮状态。
+    def _join_watch(self, code, name=""):
+        """「加入续谱」（原「预约入谱」）→ 记进续谱名单 **+ 自动加入关注**。
+
+        ★ 2026-10-02 使用者：「无论是立即入谱还是加入续谱，都自动点选加入关注」。
+          名单改动由 `toggle_follow` 落盘到谱牒 `source.watch`（重启不丢）；
+          关注那一步走 `app.toggle_focus`（即「关注即入谱」，会连带补「入谱」标）。
+        """
+        code = str(code or "")
+        if not code:
+            self.set_status("此人没有编号（手写人物），进不了续谱名单", warn=True)
+            return
+        self.toggle_follow(code)
+        if name and name not in set(self.app.focused):
+            self.app.toggle_focus(name, code)
+        self.set_status(f"已{'加入' if code in self.followed else '移出'}续谱名单：{name or code}")
+
+    def _toggle_focus_card(self, nm, btn, code=""):
+        """详情卡上的「关注人物」：切换名单并原位刷新按钮状态。
+
+        ★ 2026-10-02：带上 `code` —— 实录层人物**关注即入谱**，
+          没有编号就写不了档（`app.toggle_focus` 会说明）。
 
         ★ 2026-09-28 全项目整理（第 5 批）：按钮改走 `kit.FlatButton` 之后，
           状态刷新也走**它自己的 API**（`set_text` / `set_active`）——
@@ -1978,14 +2075,14 @@ class PersonView:
         """
         if not nm:
             return
-        self.app.toggle_focus(nm)
+        self.app.toggle_focus(nm, code)
         on = nm in set(self.app.focused)
         if hasattr(btn, "set_text"):
-            btn.set_text("已选定" if on else "选定人物")
+            btn.set_text("已关注" if on else "关注人物")
             btn.set_active(on)
         else:                                   # 兜底：万一传进来的是别的控件
             t = self.theme
-            btn.configure(text="已选定" if on else "选定人物",
+            btn.configure(text="已关注" if on else "关注人物",
                           bg=t.accent if on else t.bg_card,
                           fg=t.accent_on if on else t.text_2)
 

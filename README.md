@@ -52,7 +52,7 @@ Windows 桌面应用（Python + Tkinter），另含一个可选的平板端前�
 - **全史存档**：32 个剧本存档抽取合并为一部总谱（13,000+ 人）
 - **推定世系**：虚接（推定父子）/ 挂靠（同代人）/ 史料落定，三类边分线渲染
 - **编号映射**：政策 1637 条、能力全量收口、特质/神系等（优先由存档反解，宁缺勿猜）
-- **导出**：单文件 HTML 家谱（可发手机离线查阅）· 打包 exe
+- **导出**：**整块画布离线导出**（代际 / 时间两种模式；不依赖窗口与屏幕，逐条带流式渲染，大谱自动分块并拼 PNG + PDF）· 单文件 HTML 家谱（可发手机离线查阅）· 打包 exe
 - **平板端**：PC 侧只读 HTTP 服务 + Kotlin Compose 前端
 
 ---
@@ -101,12 +101,13 @@ app/
   ├─ names_map.py        编号 → 名字（政策 / 能力 / 特质）
   ├─ labels.py           字段与枚举中文化
   ├─ scenarios.py        剧本表与识别
-  ├─ gods.py / era.py / bio.py / profiles.py / timeline.py …
+  ├─ gods.py / era.py / bio.py / profiles.py / timeline.py / gongqing.py …
   ├─ views/              shell · tree_view · timeline_view · person_view · table_view · world_view
   ├─ dialogs/            forms（续谱 / 存档 / 编辑对话框）· msgbox
   └─ widgets/            kit（设计系统）· popcard（人物浮卡）
 tools/
   ├─ import_from_game.py  抽取 / 合并流水线核心
+  ├─ export_png           整块画布离线导出（逐条带流式渲染 · 分块 PNG + PDF）
   ├─ stage_extract · enrich_staging · merge_books   全史册流水线
   ├─ guess_lineage · merge_dups · guo_jue           推定世系与专项
   ├─ export_html · review_server · pad_data …       导出 / 复核 / 平板供数
@@ -135,7 +136,8 @@ docs/
 
 - 游戏存档（`Save_All_*`）与谱牒数据（`saves/`）—— 含个人数据且体积巨大
 - 本机配置 `config.json`（含 API Key）
-- 构建产物（`build/`、`*.exe`、`*.apk`）与开发过程产物
+- 导出产物（`导出/`、`导出画布/`）—— 大二进制
+- 构建产物（`build/`、`dist/`、`*.exe`、`*.apk`）与开发过程产物
 
 ---
 

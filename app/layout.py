@@ -1038,7 +1038,9 @@ def state_group_boxes(people, lay, tier_colors, tier_priority=None, tier_of=None
                     # ★ 同上：给「X卿」标题条（14px）让出顶部带
                     min(qys) - node_h / 2 - 12 - 18 * scale,
                     max(qright) + 4, max(qys) + node_h / 2 + 12,
-                    tier_colors.get("卿", "#555555"), sn + "卿",
+                    # ★ 兜底色与主题 `tier["卿"]` 对齐（2026-10-02 C 批：赭石）——
+                    #   主题里一定有「卿」键，这里只是防主题不全的老路径。
+                    tier_colors.get("卿", "#8B5A2B"), sn + "卿",
                 ))
 
     return state_boxes, qing_boxes

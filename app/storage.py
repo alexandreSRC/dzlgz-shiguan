@@ -55,7 +55,7 @@ DATA_FILE = "family.json"
 
 # 谱牒级的「画布状态」键（★ 2026-09-24）。原来它们住在全局 config.json 里，
 # 一本档选的名单会跟到别的书里去 —— 见模块头说明。
-CANVAS_KEYS = ("focused_people", "hidden_non_historical")
+CANVAS_KEYS = ("focused_people", "hidden_non_historical", "unfocused")
 
 _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
@@ -68,6 +68,27 @@ def ensure_saves_dir():
 
 def save_path(save_name):
     return os.path.join(SAVES_DIR, save_name, DATA_FILE)
+
+
+def book_has_people(save_name):
+    """这部谱牒里是否真的有人（空壳档不算）。
+
+    ★ 2026-10-01 使用者报「不是说什么情况都让我保存吗」：
+      原来的判据是「`save_path` 在不在」—— 而**空壳档**
+      （`{"people": {}, "cutoff_person": null}`，46 字节）也算「在」，
+      于是被当成「可续写的已有谱牒」→ 续谱走 `--merge` → 抽取器回一句
+      「谱牒档不存在或还没有人」→ 演习白跑一趟、写回也点不亮。
+    轻量做法：只读开头 4 KB 看 `people` 段是不是空的 ——
+    这个方法会在「手动指定」输入框的**每次击键**里被调到，不能 json.load 整个档。
+    """
+    try:
+        with open(save_path(save_name), "r", encoding="utf-8") as f:
+            head = f.read(4096)
+    except Exception:
+        return False
+    if re.search(r'"people"\s*:\s*\{\s*\}', head):
+        return False
+    return bool(re.search(r'"people"\s*:\s*\{', head))
 
 
 def list_saves():

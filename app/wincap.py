@@ -64,7 +64,18 @@ def _grab_screen(target, memdc, w, h):
 
 
 def _grab_printwindow(target, memdc, w, h):
-    """PrintWindow 两条路：先 PW_RENDERFULLCONTENT（Win8.1+ 更可靠），再老写法。"""
+    """PrintWindow 三条路：
+    ① **PW_CLIENTONLY|PW_RENDERFULLCONTENT**（Win8.1+）：只画客户区且
+       内容完整 —— 坐标系与 GetClientRect 一致，整块导出的裁剪靠它；
+    ② PW_RENDERFULLCONTENT：连标题栏/边框一起画（坐标系是窗外框）；
+    ③ 老 PW_CLIENTONLY。
+    """
+    try:
+        if _user32.PrintWindow(target, memdc,
+                               PW_CLIENTONLY | PW_RENDERFULLCONTENT):
+            return True
+    except Exception:
+        pass
     try:
         if _user32.PrintWindow(target, memdc, PW_RENDERFULLCONTENT):
             return True
@@ -76,8 +87,11 @@ def _grab_printwindow(target, memdc, w, h):
         return False
 
 
-def capture_widget(widget, prefer_printwindow=False):
+def capture_widget(widget, prefer_printwindow=False, size=None):
     """抓取控件客户区，返回 (宽, 高, BGRA 字节)。
+
+    `size=(w, h)`：显式指定位图尺寸 —— 最小化窗口的 GetClientRect 是 0×0，
+    但 PrintWindow(PW_RENDERFULLCONTENT) 仍能按还原尺寸渲染（后台导出用）。
 
     ★ 2026-09-28 重写取图顺序（修「导出黑图」）：
       ① 目标窗口取 **顶层**（`GA_ROOT`）—— Tk 的子控件大多没有真 HWND，
@@ -95,9 +109,12 @@ def capture_widget(widget, prefer_printwindow=False):
     hwnd = widget.winfo_id()
     target = _user32.GetAncestor(hwnd, GA_ROOT) or hwnd
 
-    rect = wintypes.RECT()
-    _user32.GetClientRect(target, ctypes.byref(rect))
-    w, h = rect.right, rect.bottom
+    if size is not None:
+        w, h = int(size[0]), int(size[1])
+    else:
+        rect = wintypes.RECT()
+        _user32.GetClientRect(target, ctypes.byref(rect))
+        w, h = rect.right, rect.bottom
     if w <= 0 or h <= 0:
         raise RuntimeError(f"控件尺寸异常: {w}x{h}")
 
@@ -165,6 +182,18 @@ def save_png(path, width, height, bgra):
         f.write(_chunk(b"IEND", b""))
 
 
+def client_offset_in_window(widget):
+    """PrintWindow(PW_RENDERFULLCONTENT) 会把**非客户区**（标题栏/边框）也画
+    进缓冲 —— 返回客户区原点在窗面缓冲里的偏移 (off_x, off_y)，裁剪时用。"""
+    hwnd = widget.winfo_id()
+    target = _user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+    pt = wintypes.POINT()
+    _user32.ClientToScreen(target, ctypes.byref(pt))
+    wr = wintypes.RECT()
+    _user32.GetWindowRect(target, ctypes.byref(wr))
+    return (pt.x - wr.left, pt.y - wr.top)
+
+
 def real_visible_size(img, rel_x, rel_y, vw, vh):
     """从整窗截图里**实测**画布真实可见宽高。
 
@@ -176,6 +205,12 @@ def real_visible_size(img, rel_x, rel_y, vw, vh):
     y_lo, y_hi = rel_y + 10, min(rel_y + vh, img.height) - 10
     x_lo, x_hi = rel_x + 10, min(rel_x + vw, img.width) - 10
     if y_hi <= y_lo or x_hi <= x_lo:
+        return vw, vh
+    # ★ 2026-10-02：深色画布防御 —— 画布中心若本身是深色（墨夜类主题/
+    #   黑屏），「从右往左找黑边」会把内容误判成边。只有中心是浅色时
+    #   才做黑边收缩。
+    cx, cy = rel_x + vw // 2, rel_y + vh // 2
+    if sum(px[cx, cy][:3]) < 360:
         return vw, vh
 
     def col_black(x):

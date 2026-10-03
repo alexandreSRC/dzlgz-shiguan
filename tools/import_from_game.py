@@ -64,6 +64,7 @@ sys.path.insert(0, ROOT)
 #   本文件可被子进程当 CLI 调起，era.py 不依赖 tkinter，两边共用安全。
 from app.era import era_of as _era_of
 from app.era import parse_bc_year as _parse_bc_year
+from app.era import player_king_code as _player_king_code
 
 PLACEHOLDER_SUFFIX = re.compile(r"(父|祖|曾|高)$")
 ALPHA_CODE = re.compile(r"[A-Za-z]+\d{1,4}")      # QIN001 这类字母前缀的史实号
@@ -1224,9 +1225,16 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
 
     ph = {c for c in core if _is_ph(c)}
     core -= ph
-    extra = {c for c, r in by_code.items()
-             if r.get("_tbl") != "族谱表" and c not in ph
-             and (is_hist(c) or (not is_female(r) and has_kid(c)))}
+    if prune == "all":
+        # ★ 2026-10-03 使用者裁定（C 口径）：「所有非史实后裔都入谱、女性也收」
+        #   ⇒ 非占位真人**全要**，不再按「史实 / 非女性且有子女」卡人 ——
+        #   实测卡人的正是这一步（非史实叶子/女性被剔，父链又断，谁都救不回来）。
+        extra = {c for c, r in by_code.items()
+                 if r.get("_tbl") != "族谱表" and c not in ph}
+    else:
+        extra = {c for c, r in by_code.items()
+                 if r.get("_tbl") != "族谱表" and c not in ph
+                 and (is_hist(c) or (not is_female(r) and has_kid(c)))}
     keep = core | extra
     # （减号用 ASCII —— U+2212 在 GBK 管道下 print 会 UnicodeEncodeError）
     print(f"  族谱表 {len(core) + len(ph)} 人 - 占位祖先 {len(ph)} 人（全要） "
@@ -1295,10 +1303,21 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
     _ref_f, _ref_m = {}, {}
     for _c in keep:
         _rec = by_code[_c]
-        for _rc, _rn, _dst in (("Father_Code", "Father_Name", _ref_f),
-                               ("Mother_Code", "Mother_Name", _ref_m)):
+        _par = _rec.get("Parent") or {}
+        for _rc, _rn, _pk, _dst in (("Father_Code", "Father_Name", "Father", _ref_f),
+                                    ("Mother_Code", "Mother_Name", "Mother", _ref_m)):
             _pc = str(_rec.get(_rc) or "").strip()
             _pn = str(_rec.get(_rn) or "").strip()
+            # ★ 2026-10-02：顶层没有父/母编号时**退回 `Parent` 字典**再取一次。
+            #   实测《秦末起义》里 姬结/姬宋 这类记录**只有**
+            #   `Parent.Father = {Ren_Code, Ren_Name}`、没有顶层 `Father_Code`，
+            #   旧判据看不见它们 ⇒ 不补桩 ⇒ 下游 `resolve_parent` 落进「按名回捞」，
+            #   把父接到了同名的另一个人（姬结→姬宁 2406、姬宋→姬午 2036，
+            #   父子倒挂 68 / 104 年）。判据与 `resolve_parent` 的取数口径保持一致。
+            if not _pc or _pc == "-1":
+                _d = _par.get(_pk) or {}
+                _pc = str(_d.get("Ren_Code") or "").strip()
+                _pn = str(_d.get("Ren_Name") or "").strip()
             if _pc and _pc != "-1" and _pn and _pc not in keep:
                 _dst.setdefault(_pc, _pn)
     _syn = set()
@@ -1322,6 +1341,15 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
         name2codes[name_of(by_code[c])].append(c)
 
     def resolve_parent(rec):
+        """父母：**编号优先，有编号就不许猜名**。
+
+        ★ 2026-10-02 修「按名接错人」：旧写法在 `Ren_Code` **非空但接不上**时
+        也去 `name2codes` 里按 `Ren_Name` 猜，只要同名唯一就连 —— 实测把
+        姬结（实录父 2567 姬宁）、姬宋（2401 姬午）接成了本档同名的另一个人
+        （2406 姬宁 / 2036 姬午），父子倒挂 68 / 104 年，而且是**实线硬边**。
+        现在：编号非空就只认编号（上游补桩后一般已进 keep），接不上就留空；
+        只有编号**缺失**时，才允许按名回捞。
+        """
         parts = []
         for k, ck in (("Father_Code", "Father"), ("Mother_Code", "Mother")):
             fc = str(rec.get(k) or "").strip()
@@ -1333,17 +1361,47 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
                     continue
                 d = par.get(key) or {}
                 rc = str(d.get("Ren_Code") or "").strip()
-                if rc in keep:
-                    parts[i] = rc
-                else:
-                    rn = str(d.get("Ren_Name") or "").strip()
-                    cs = name2codes.get(rn) or []
-                    if len(cs) == 1:
-                        parts[i] = cs[0]
+                if rc and rc != "-1":
+                    if rc in keep:
+                        parts[i] = rc
+                    continue        # 有编号 ⇒ 不按名猜
+                rn = str(d.get("Ren_Name") or "").strip()
+                cs = name2codes.get(rn) or []
+                if len(cs) == 1:
+                    parts[i] = cs[0]
         return parts[0], parts[1]
 
     father_get = {c: resolve_parent(by_code[c])[0] for c in keep}
     mother_get = {c: resolve_parent(by_code[c])[1] for c in keep}
+
+    # ---- 2b. 孤立的非史实女性不入谱（2026-10-03 使用者裁定）----
+    #   原话：「如果是单人非史实的女角色，不要入谱」。
+    #   缘起：`prune == "all"`（C 全收口径）会把人物各表的**非史实女性一律**收进来，
+    #   其中一大批在谱里**一条边都没有** —— 女不载于族谱表（无父），又没嫁进/没在本谱
+    #   内生养，于是悬成一堆孤立节点（实测「秦末起义」431 人）。这类留之无用，剔掉。
+    #   判据：非史实 + 女性 + 在**谱内**无父、无母、无配偶，且不是任何人的父/母
+    #        （自身 `Ren_Zi_Nv_Code_Array` 也没有落在谱内的子女）。
+    #   ⚠️ `hist` 等口径本来就不收非史实，无需再判，故只在 `all` 下生效。
+    #   ⚠️ 单趟判定即可：一个女性若育有谱内子女，她就落在 `_parents_in` 里 → 保留；
+    #      其子女的 `mother_get` 也指向她（在 keep 内）→ 子女也保留，不会连锁削人。
+    if prune == "all":
+        _parents_in = {p for p in
+                       list(father_get.values()) + list(mother_get.values()) if p}
+        _lone = set()
+        for c in keep:
+            r = by_code[c]
+            if is_hist(c) or not is_female(r):
+                continue
+            if father_get.get(c) or mother_get.get(c) or c in _parents_in:
+                continue
+            if any(str(x) in keep for x in (r.get("Ren_Pei_Ou_Code_Array") or [])):
+                continue
+            if any(str(x) in keep for x in (r.get("Ren_Zi_Nv_Code_Array") or [])):
+                continue
+            _lone.add(c)
+        if _lone:
+            keep -= _lone
+            print(f"  剔除非史实孤立女性 {len(_lone)} 人（谱内无父/母/配偶/子女）")
 
     # ---- 3. 名字（氏+名；重名缀中文序数） ----
     titles_all = load_titles(src)      # 重名排序要看有没有爵位，先读出来
@@ -1546,6 +1604,34 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
         keep_line = {c for c in keep if is_hist(c)}
         print(f"  只收史实人物：{len(keep)} 人 → {len(keep_line)} 人")
         keep = keep_line
+    elif prune == "hist-line":
+        # ★ 2026-10-03 使用者裁定（原话）：「所有史实人物的后裔包括后裔的后裔，
+        #   不论史实还是非史，每次续谱都更新；我加了关注的非史始祖，后裔也更新。」
+        #   ⇒ 出发点 = 史实人物 ∪ 续谱名单点名者，沿**父系后裔链**往下走，
+        #     链上的人**不看史实性**一律入谱；只有「非史实、又无爵位」的女性
+        #     仍按老口径挡在谱外（「只有史实女角色才写上」）。
+        #   ⚠️ 与 `anon` 的**唯一**差别是出发点：anon 用「选定始祖」（上古时代的
+        #      21 个根节点，本档往往只锚定到 1 个 ⇒ 非史实后裔永远进不来），
+        #      本口径用「史实 + 点名者」—— 这才是使用者要的那条线。
+        _seeds2 = {c for c in keep if is_hist(c)} | set(watch_keep or ())
+        _desc, _stack = set(), list(_seeds2)
+        while _stack:
+            _x = _stack.pop()
+            for _ch in sons.get(_x, []):
+                if _ch not in _desc:
+                    _desc.add(_ch)
+                    _stack.append(_ch)
+        line = _seeds2 | _desc
+        keep_line = {c for c in line
+                     if not is_female(by_code[c]) or has_jue(c) or is_hist(c)}
+        print(f"  史实+点名者 {len(_seeds2)} 个 → 父系后裔链 {len(line)} 人 → "
+              f"剪非史实女性后留 {len(keep_line)} 人（口径 [hist-line]）")
+        keep = keep_line
+    elif prune == "all":
+        # ★ 2026-10-03 使用者裁定（C 口径）：「非史实后裔都入谱、女性也收」。
+        #   1a 已经把 extra 扩成「除占位祖先外全要」，这里**不做始祖限定**、
+        #   不做史实/女性剪枝 —— keep 原样保留。
+        print(f"  全收（除占位祖先）：{len(keep)} 人（口径 [all]）")
     elif seed_codes:
         desc, stack = set(), list(seed_codes)
         while stack:
@@ -2056,9 +2142,12 @@ def detect_era(src):
     这里只负责把**扁平目录**里的数据读成行列表：
       · `Save_Wang_Chao_Data.json`（列表，实测长度 2）
       · `Save_KingData_*.json`（全世界 151 国，一国一个文件）
+      · `Shi_Zhuan_Controller.json`（世传：玩家国名 → 反查玩家 `King_Code`）
     本文件要被子进程当 CLI 调起、不能 import 主程序（会拉进 tkinter）；
     era.py 不依赖 tkinter，两边共用安全。
     （关键认知：151 国的 King_Stage **同时代并存**，见 era.py 模块头。）
+
+    ★ 2026-10-02 修：玩家国不再假定 `King_Code == 0`（实测 0 是秦、玩家是楚）。
     """
     wc = _read_json(os.path.join(src, "Save_Wang_Chao_Data.json"))
     wc_rows = wc if isinstance(wc, list) else ([wc] if isinstance(wc, dict) else [])
@@ -2072,7 +2161,10 @@ def detect_era(src):
             rec0 = o.get("King_Stage_Record")
             if isinstance(rec0, list) and rec0:
                 rec_rows = rec0
-    return _era_of(wc_rows, rec_rows, kd_rows)
+    sz = _read_json(os.path.join(src, "Shi_Zhuan_Controller.json"))
+    sz_rows = sz if isinstance(sz, list) else ([sz] if isinstance(sz, dict) else [])
+    return _era_of(wc_rows, rec_rows, kd_rows,
+                   _player_king_code(sz_rows, kd_rows))
 
 
 def _read_json(p):
@@ -2212,7 +2304,8 @@ UPGRADE_FIELDS = ("historical", "divine")
 #   所以这五个字段改走 `FACT_KEEP`（见下），FACT_CLEAR 留空表以保留调用点。
 FACT_CLEAR = ()
 
-# 封国 / 爵位 / 世系 —— **只写新人，老人一律不动**（使用者 2026-09-21 裁决）。
+# 封国 / 爵位 / 世系 —— ★ 2026-10-03 起**以新换旧**（使用者裁定「覆盖，没毛病」）。
+#   旧口径「只写新人，老人一律不动」（2026-09-21）已作废，见 merge 里的 FACT_KEEP 循环。
 #
 # 为什么单独列一组、而不是并进 HAND_FIELDS：
 #   · HAND_FIELDS 的语义是「手写字段」（小传/注释/配色/祖序），判据是「旧值非空就留」；
@@ -2466,13 +2559,13 @@ def _merge_rec(ov, fv, code, gen_src, report):
     # ★ 封国 / 爵位 / 世系：**只写新人，老人一律不动**（使用者 2026-09-21 裁决）。
     #   判据是「旧记录里有没有这个键」，不是「旧值是否为空」——
     #   `fief_gen = 0`（明确不是君主）也是要保留的结论，不能被新值顶掉。
+    # ★ 2026-10-03 使用者裁定（口径反转）：封国/爵位/世系**以新换旧**——
+    #   「覆盖，以新换旧没毛病」（他封了新诸侯，谱里要跟着变）。
+    #   旧的「只写新人、老人不动」作废。
     for k in FACT_KEEP:
-        if k in ov:
-            if ov[k] != fv.get(k):
-                report["fact_kept"] += 1
-            rec[k] = ov[k]
-        else:
-            rec[k] = fv.get(k, "")
+        if ov.get(k) != fv.get(k):
+            report["fact_kept"] += 1
+        rec[k] = fv.get(k, "")
     # ★★ 2026-09-24：多庙共祭的**共同远祖**要修掉，不吃 FACT_KEEP 的「老人物不动」。
     #   为什么可以破例：这几个字段对这批人是**旧版抽取器按「先遍历到哪个宗庙就
     #   归哪个」写下的机器错判**（巢皇 → 秦·第1代、共工 → 越裳·第1代），
@@ -2743,8 +2836,8 @@ def format_report(report, meta=None, dry_run=True):
              f"升为史实 {report['upgraded']} 条")
     if report["fact_upgraded"]:
         L.append(f"  生卒补全年月日 {report['fact_upgraded']} 条")
-    L.append(f"  封国/爵位/世系沿用旧值 {report['fact_kept']} 条"
-             f"（★ 老人物一律不动，只有新人才写抽取值）")
+    L.append(f"  封国/爵位/世系以新换旧 {report['fact_kept']} 条"
+             f"（★ 2026-10-03 使用者裁定：覆盖，游戏新值顶掉旧值）")
     if report.get("ancestor_fixed"):
         # ★ 2026-09-24：共同远祖不吃「老人物不动」—— 旧版把它们按「先遍历到
         #   哪个宗庙就归哪个」写成了某国第N代（巢皇 → 秦·第1代），属机器错判。
@@ -3114,10 +3207,12 @@ def main():
                     help="始祖名单，逗号分隔；不给则从 --seeds-from 的树根节点自动取")
     ap.add_argument("--seeds-from", default="",
                     help="从哪个存档读根节点当始祖（默认上古时代）")
-    ap.add_argument("--prune", default="anon",
-                    choices=["none", "male-son", "anon", "hist"],
-                    help="筛人方式：hist 只收史实人物 / none 全要 / "
-                         "male-son 剪无男嗣的男性 / anon（默认）再剪匿名女性")
+    ap.add_argument("--prune", default="all",
+                    choices=["none", "male-son", "anon", "hist", "hist-line", "all"],
+                    help="筛人方式：**all（默认，使用者 2026-10-03 口径 C）**＝"
+                         "除占位祖先外全要（史实/非史实、女性都收）；"
+                         "hist-line＝史实 + 父系后裔链 ∪ 点名者；hist 只收史实；"
+                         "none 全要 / male-son 剪无男嗣男性 / anon 按「选定始祖」限定")
     ap.add_argument("--real-state-only", action="store_true",
                     help="只保留真封国（宗庙 / 势力），不再拿氏当封国；"
                          "没有真封国的人留空")
@@ -3137,7 +3232,8 @@ def main():
     ap.add_argument("--watch", default="",
                     help="续谱名单：逗号分隔的存档编号。名单里的人（以及他们的"
                          "父系后裔链）会被额外收进谱，**不受 --prune 剪枝影响**。"
-                         "使用者的口径：非史实人物默认一个都不要，只有点名的才收。")
+                         "★ 2026-10-03 口径：史实人物的后裔本来就全部入谱；"
+                         "点名只对「不属于任何史实人物后裔链」的非史实始祖必要。")
     ap.add_argument("--person", default="",
                     help="单人入谱（M0 桥）：把这一个 Ren_Code 的人并入 --save 的 "
                          "family.json，不做整档抽取；配合阅览器「⇱ 入谱」按钮使用")
@@ -3169,8 +3265,8 @@ def main():
                              lineage=bool(args.lineage))
 
     seeds = [s.strip() for s in args.seeds.split(",") if s.strip()]
-    if args.prune == "hist":
-        pass                      # 只收史实，不需要始祖名单
+    if args.prune in ("hist", "all", "hist-line"):
+        pass                      # 这三个口径都不依赖始祖名单
     elif not seeds:
         ref = args.seeds_from or "上古时代"
         p = os.path.join(ROOT, "saves", ref, "family.json")

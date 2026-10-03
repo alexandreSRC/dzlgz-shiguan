@@ -1452,7 +1452,7 @@ def extend_dialog(app):
     # 那时 btn_dry[0] 还是 None，跳过即可（按钮画完 `extra` 里再补上）。
     btn_dry = [None]
     btn_apply = [None]
-    state = {"dry_ok": False, "busy": False}
+    state = {"dry_ok": False, "dry_done": False, "dry_out": "", "busy": False}
 
     def cur_slot_path():
         """当前选中槽的**本机目录**（空串 = 这个槽还没拉到本机）。
@@ -1771,6 +1771,8 @@ def extend_dialog(app):
         finally:
             state["busy"] = False
         state["dry_ok"] = bool(ok)
+        state["dry_done"] = True
+        state["dry_out"] = out or ""
         _adopt_pulled()
         # ★ 2026-09-22 修（B 批第 3 条）：写回还要再过一道闸门 —— 看**当前计划**是什么动作。
         #   命中保护档（skip）时允许跑演习（只读，拿报告用），但**绝不能**因此
@@ -1780,7 +1782,12 @@ def extend_dialog(app):
         #   真写之前还有 `do_apply` 的确认框 + `state["dry_ok"]` 二次闸门。
         act_now = (plan_state.get("plan") or {}).get("action")
         if btn_apply[0] is not None:
-            btn_apply[0].set_enabled(bool(ok) and act_now != "skip")
+            # ★ 2026-10-01 使用者：「不是说什么情况都让我保存吗」——
+            #   原来这里要求 `bool(ok)`，演习一失败「② 备份并写回」就灰死；
+            #   而失败常常只是判定口径不对（如空壳档冒充已有谱牒），并非数据有问题。
+            #   现在：**跑过演习、且目标不是保护档**就点亮；
+            #   演习失败时 `do_apply` 会先弹一个带失败原因的确认框。
+            btn_apply[0].set_enabled(act_now != "skip")
         write("\n演习通过。核对上面的数字无误，再点「② 备份并写回」。" if ok
               else "\n演习失败，未动任何文件。")
         prog_lbl.configure(text="演习结束。" if ok else "演习失败。")
@@ -1788,9 +1795,18 @@ def extend_dialog(app):
     def do_apply():
         if state["busy"]:
             return
-        if not state["dry_ok"]:
+        if not state.get("dry_done"):
             messagebox.showinfo("续谱", "请先点「① 先演习」，看过报告再写回。")
             return
+        if not state["dry_ok"]:
+            # 演习没通过 —— 不再硬拦（使用者 2026-10-01：「不是说什么情况都让我保存吗」），
+            # 但把失败原因摆出来让他自己拍板；写回本身仍有自动备份 + Ctrl+Z 一步撤销。
+            if not messagebox.ask_confirm(
+                    "续谱",
+                    "上次演习没有通过：\n\n"
+                    + (state.get("dry_out") or "（没有报告）")[-400:]
+                    + "\n\n仍要写回吗？", ok_text="仍要写回"):
+                return
         # 目标以**演习时实际定下**的那份为准（`run_extend` 记的 `_extend_last`）；
         # 演习后 `_adopt_pulled()` 也会把 plan 刷新成真实结果，两者一致。
         last = getattr(app, "_extend_last", None) or {}

@@ -378,7 +378,14 @@ class Layout:
             return [], ""
         m, n, x1, y1, x2, y2 = pair
         skip = (self.positions[m], self.positions[n])
-        pts, kind = _route(x1, y1, x2, y2, self._ensure_grid(), None, skip)
+        # ★ 2026-10-03 修「打开时间家谱卡死」：母线**不走 A* 兜底**。
+        #   实测秦末档 403 条母系额外线：378 次落进 A*（94%），而 A* 里 **88%
+        #   最后也失败**退回直斜线 —— 白花 59s（scale4）/ 172s（scale9）；
+        #   屏上 redraw 逐条惰性路由，于是「一切到时间家谱就卡几十秒」。
+        #   母线是**次要虚线**（挂在父线之外的那条婚色线），不值得这个代价：
+        #   fold / channel 照试，失败直接退直斜线（与 A* 失败时**同一结果**）。
+        pts, kind = _route(x1, y1, x2, y2, self._ensure_grid(), None, skip,
+                           use_astar=False)
         self._paths[key] = (pts, kind)
         self._kinds[kind] += 1
         return self._paths[key]
@@ -677,7 +684,8 @@ def _levels(lo: float, hi: float, my: Optional[float]) -> List[float]:
 
 
 def _route(x1: float, y1: float, x2: float, y2: float, grid: _Grid,
-           my: Optional[float] = None, skip=()) -> Tuple[List[Tuple[float, float]], str]:
+           my: Optional[float] = None, skip=(),
+           use_astar: bool = True) -> Tuple[List[Tuple[float, float]], str]:
     """返回 (折线顶点列表, 类型)。
 
     y1 = 起点卡的那条边，y2 = 终点卡的那条边。**两者谁大谁小都行** ——
@@ -734,9 +742,11 @@ def _route(x1: float, y1: float, x2: float, y2: float, grid: _Grid,
 
     # 兜底：局部 A* 寻路。**「连线不能从卡上压过去」是硬要求**，
     # 所以这里宁可贵一点，也不能退回直斜线（直斜线正是「连线被卡片遮挡」的来源）。
-    pts = _route_astar(x1, y1, x2, y2, grid, skip=skip)
-    if pts:
-        return pts, "channel"
+    # `use_astar=False` 给**母线**用（母线是次要虚线，见 path_for_mother 处的说明）。
+    if use_astar:
+        pts = _route_astar(x1, y1, x2, y2, grid, skip=skip)
+        if pts:
+            return pts, "channel"
 
     # 理论上到不了这里；真到了就画直斜线并计入 links_diagonal，自检会把它当缺陷报出来
     return [(x1, y1), (x2, y2)], "diagonal"

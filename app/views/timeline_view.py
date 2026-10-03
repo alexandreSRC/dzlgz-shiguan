@@ -14,6 +14,7 @@
 """
 import tkinter as tk
 import tkinter.font as tkfont
+import os
 from tkinter import Scrollbar
 
 from .. import dpi as _dpi
@@ -564,7 +565,7 @@ class TimelineView:
     def card_h(self):
         return self.lay.card_h if self.lay is not None else T.PLATES[self.plate][0]
 
-    def export_full(self, path_prefix, on_progress=None, max_side=16000):
+    def export_full(self, path_prefix, on_progress=None, max_side=9000):
         """★ 2026-09-27 v3 时间家谱整块导出：超级大窗 + 左沿朝代带。
 
         与代际树同法（收侧栏 → 超级大窗 → PrintWindow 一屏全收），
@@ -572,6 +573,7 @@ class TimelineView:
         """
         import math
         from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None   # 自己导出的图，解除 1.79 亿像素上限
         from app import wincap
         if self.lay is None:
             raise RuntimeError("时间轴还没有布局（先打开一个谱牒）")
@@ -596,9 +598,21 @@ class TimelineView:
             new_w = min(max_side, max(rel_x + rail_w + total_w + 12,
                                       c.winfo_width()))
             new_h = min(max_side, max(rel_y + total_h + 12, c.winfo_height()))
-            top.geometry(f"{new_w}x{new_h}+0+0")
+            # ★ 虚拟大屏定位（使用者思路）：装了虚拟显示器驱动
+            #   （Parsec VDD 等）时，虚拟屏在主屏右侧 —— 大窗摆过去，
+            #   **使用者的桌面完全不受影响**；没装则留在主屏（导出几秒）。
+            try:
+                import ctypes as _ct
+                _vsx = _ct.windll.user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+                _vsw = _ct.windll.user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+            except Exception:
+                _vsx, _vsw = 0, c.winfo_screenwidth()
+            _vright = _vsx + _vsw
+            pos_x = (_vright + 20 if _vright > c.winfo_screenwidth()
+                     else 0)
+            top.geometry(f"{new_w}x{new_h}+{pos_x}+40")
             top.update()
-            top.update()          # 二次 update：等工具栏收稳再量 rel 偏移
+            top.update()          # 二次 update：等布局收稳再量 rel 偏移
             rel_x = c.winfo_rootx() - top.winfo_rootx()
             rel_y = c.winfo_rooty() - top.winfo_rooty()
             vis_w = max(50, new_w - rel_x)
@@ -620,11 +634,24 @@ class TimelineView:
                         c, prefer_printwindow=True)
                     img = Image.frombuffer(
                         "RGBA", (w_img, h_img), bgra, "raw", "BGRA").convert("RGB")
+                    # PrintWindow 连标题栏/边框一起画进缓冲 → 裁剪起点
+                    # 要加客户区在窗面里的偏移（差值 = 标题栏高，实测 45px）
+                    off_x, off_y = wincap.client_offset_in_window(c)
                     vis_w2, vis_h2 = wincap.real_visible_size(
-                        img, rel_x, rel_y, vis_w, vis_h)
-                    out = img.crop((rel_x, rel_y,
-                                    rel_x + min(vis_w2, total_w - x0),
-                                    rel_y + min(vis_h2, total_h - y0)))
+                        img, off_x + rel_x, off_y + rel_y, vis_w, vis_h)
+                    out = img.crop((off_x + rel_x, off_y + rel_y,
+                                    off_x + rel_x + min(vis_w2, total_w - x0),
+                                    off_y + rel_y + min(vis_h2, total_h - y0)))
+                    rr_x = rail.winfo_rootx() - top.winfo_rootx()
+                    rr_y = rail.winfo_rooty() - top.winfo_rooty()
+                    rail_img = img.crop((off_x + rr_x, off_y + rr_y,
+                                         off_x + rr_x + rail_w,
+                                         off_y + rr_y + out.height))
+                    full = Image.new("RGB", (rail_w + out.width, out.height),
+                                     "#f7f2e7")
+                    full.paste(rail_img, (0, 0))
+                    full.paste(out, (rail_w, 0))
+                    out = full
                     rr_x = rail.winfo_rootx() - top.winfo_rootx()
                     rr_y = rail.winfo_rooty() - top.winfo_rooty()
                     rail_img = img.crop((rr_x, rr_y,
@@ -636,7 +663,10 @@ class TimelineView:
                     out = full
                     fp = path_prefix + (".png" if n_cols * n_rows == 1 else
                                         f"_r{ri + 1}c{ci + 1}.png")
+                    os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
                     out.save(fp)
+                    if not os.path.exists(fp):
+                        raise RuntimeError(f"保存后文件消失：{fp}（可能被杀软拦截）")
                     files.append((fp, out.width, out.height))
         finally:
             self.master.export_chrome(False)
