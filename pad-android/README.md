@@ -6,17 +6,17 @@
 ## 一、跑起来（三步）
 
 1. **PC 起服务**：双击项目根目录的 `Start_平板服务.bat`
-   （首次取数约 15 秒；窗口里会打印平板要填的地址，形如 `http://__SHIGUAN_LAN_IP__:8801`）
+   （首次取数约 15 秒；窗口里会打印平板要填的地址，形如 `http://<PC 局域网IP>:8801`）
 2. **编译安装**（已构建过一次，改代码后重跑）：
    ```powershell
-   $env:JAVA_HOME='D:\Java\jdk-21.0.9+10'
-   cd "__SHIGUAN_APPS__\大周列国志·史馆\pad-android"
-   D:\Gradle\gradle-8.11.1\bin\gradle.bat :app:assembleDebug
-   D:\Android\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app-debug.apk
+   $env:JAVA_HOME='<你的 JDK 21 目录>'
+   cd <仓库根>\pad-android
+   <gradle 目录>\bin\gradle.bat :app:assembleDebug
+   <platform-tools>\adb.exe install -r app\build\outputs\apk\debug\app-debug.apk
    ```
 3. **打开 App**。连不上会显示明确提示（地址 + 排查建议），点「重试」。
 
-> 服务器地址目前写在 `data/ApiClient.kt` 的 `baseUrl`，默认 `http://__SHIGUAN_LAN_IP__:8801`。
+> 服务器地址目前写在 `data/ApiClient.kt` 的 `baseUrl`，默认 `http://<PC 局域网IP>:8801`。
 > 换网络/换机器要改这一行重编译（后续可做设置界面）。
 
 ## 二、目录
