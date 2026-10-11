@@ -47,3 +47,6 @@ Thumbs.db
 
 # 内部交接文档（含本机路径与内部纪律）不公开
 docs/交接-避坑.md
+
+# 「上传版」脱敏映射表（真路径清单，只留本机）
+tools/_public_filter.local.json

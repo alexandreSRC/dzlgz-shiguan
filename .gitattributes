@@ -1,0 +1,17 @@
+# ══ 「上传版」路径脱敏（使用者裁定：本地不要动，上传的弄上传版）══
+# 提交 / 推送走 clean 过滤器（本机真路径 → 占位符），检出 / 还原走 smudge（占位符 → 真路径）
+# ⇒ 工作区文件一个字节都不动，进仓库的是脱敏版。
+# 过滤器本体 = tools/_public_filter.py；本机需一次性配置 filter.public.*（见该脚本 docstring）。
+# ⚠️ 该脚本自身**不脱敏**（它要留真路径才能做映射），故最后一行排除它。
+*.py           filter=public
+*.md           filter=public
+*.bat          filter=public
+*.vbs          filter=public
+*.spec         filter=public
+*.json         filter=public
+*.html         filter=public
+*.txt          filter=public
+*.properties   filter=public
+*.kt           filter=public
+*.kts          filter=public
+tools/_public_filter.py -filter
