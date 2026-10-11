@@ -55,7 +55,11 @@ DATA_FILE = "family.json"
 
 # 谱牒级的「画布状态」键（★ 2026-09-24）。原来它们住在全局 config.json 里，
 # 一本档选的名单会跟到别的书里去 —— 见模块头说明。
-CANVAS_KEYS = ("focused_people", "hidden_non_historical", "unfocused")
+CANVAS_KEYS = ("focused_people", "hidden_non_historical", "unfocused",
+               # ★ 2026-10-04 使用者：「**只高亮手动选定的人**，但后裔也默认选定
+               #   （也要显示）」—— 「关注」名单被公卿自动关注填到 700+，
+               #   不能再兼任「选定高亮」。这里单开一张**手动**名单。
+               "selected_people")
 
 _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 

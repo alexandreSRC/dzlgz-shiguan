@@ -156,7 +156,32 @@ def _sect(parent, theme, title, rows, body_px, val_font):
                      font=val_font).grid(row=0, column=1, sticky="w", padx=(6, 0))
 
 
-def build_popcard(canvas, theme, people, name, width=POP_W):
+def _record_profile(app, name):
+    """按**姓名**去「实录层派生表」取最全档案（`profiles.Profile`），取不到返回 None。
+
+    ★ 与 `table_view._archive_row` 同一套路（那里也是 `app.record_people` +
+      姓名索引）：**谱牒档没有 code 锚点**，所以只能按姓名匹配。
+      复用它的索引缓存 `app._archive_name_index`，不另建一套。
+    """
+    pool = getattr(app, "record_people", None) or {}
+    if not pool or not name:
+        return None
+    idx = getattr(app, "_archive_name_index", None)
+    if idx is None or len(idx) != len(pool):
+        idx = {}
+        for c, p in pool.items():
+            nm = getattr(p, "name", "") or ""
+            if nm and nm not in idx:
+                idx[nm] = c
+        try:
+            app._archive_name_index = idx
+        except Exception:
+            pass
+    c = idx.get(name)
+    return pool.get(c) if c else None
+
+
+def build_popcard(canvas, theme, people, name, width=POP_W, app=None):
     """拼一张小传卡，返回 (Frame, 宽, 高)。
 
     要点：
@@ -172,15 +197,18 @@ def build_popcard(canvas, theme, people, name, width=POP_W):
     UI 改进 C14：默认 224px；正文折出来超过 POP_TALL 像素高（长小传折成
     细长条）时，自动升 300px 档重拼一次。调用方只消费返回的宽高，零改动。
     """
-    built = _build(canvas, theme, people, name, width)
+    # ⚠️ 2026-10-04 修：`_build` 才是实体（薄壳 → 实体），
+    #   往实体里加参数时**必须同时改这里两处调用**（含下面那条「太胖就换宽卡」的重建），
+    #   否则 `_build` 里用到 `app` 就 `NameError`，表现为**小传整张不出来**（日志实锤）。
+    built = _build(canvas, theme, people, name, width, app)
     if built is None:
         return None
     if width == POP_W and built[2] > POP_TALL:
-        return _build(canvas, theme, people, name, POP_W2)
+        return _build(canvas, theme, people, name, POP_W2, app)
     return built
 
 
-def _build(canvas, theme, people, name, width):
+def _build(canvas, theme, people, name, width, app=None):
     """按给定宽度拼卡（build_popcard 的实体，供双档宽度复用）。"""
     info = people.get(name)
     if not info:
@@ -245,10 +273,10 @@ def _build(canvas, theme, people, name, width):
         if info.get("fief_gen"):
             state = f"{state} · 第{info['fief_gen']}代"
         ident.append(("封国", state))
-    ident.append(("爵位", info.get("fief_title") or "—"))
+    # ★ 2026-10-04 使用者：「把**爵位**和**史实**两项删去，加上**年龄**和**余寿**。」
+    #   ⇒ 这两行删除（爵位另在标题行的爵色 chip 里已表达；史实看画布/谱牒即可）。
     if info.get("note"):
         ident.append(("尊号", info["note"]))
-    ident.append(("史实", "是" if info.get("historical") == "是" else "否"))
 
     life = []
     if info.get("birth"):
@@ -258,7 +286,18 @@ def _build(canvas, theme, people, name, width):
     # ★ 2026-09-26：真实卒年缺失时用「生年 + 享年」推定（与表格页 / Profile 同一口径）。
     #   ⚠️ 不加「（推定）」括注 —— 九十三批续十二裁定「括注一律不要」，
     #   依据由「天寿」属性承载（`Profile.tianshou`）。
+    # ★ 2026-10-04 使用者：「铭牌小传，**生年 卒年 年龄 余寿**」——
+    #   「卒于」原来**显示不出来** ✗：在世人物游戏不写 `death`，谱牒 `extra.Ren_End_Old`
+    #   （享年）也常常没有 ⇒ 推定链**断在第一步**。而「年龄/余寿」之所以能显示，
+    #   是因为它们走的是**实录层的 `Profile`**（下面那段）。
+    #   ⇒ 卒年改与它俩同源：**先取实录层 Profile**，其 `death` 就是「生年 + 享年」推定的
+    #     结果（与人物表格同一口径）。**顺序必须是：生于 → 卒于 → 年龄 → 余寿。**
+    _pf = _record_profile(app, name) if app is not None else None
     _death = str(info.get("death") or "")
+    if not _death.strip() and _pf is not None:
+        _d2 = _pf.value_of("death")
+        if _d2 and str(_d2) != "—":
+            _death = str(_d2)
     if not _death.strip():
         _eo = (info.get("extra") or {}).get("Ren_End_Old")
         if _eo not in (None, "", 0):
@@ -271,6 +310,19 @@ def _build(canvas, theme, people, name, width):
                 _death = ""
     if _death.strip():
         life.append(("卒于", L.humanize_time_long(_death) or _death))
+    # ★ 2026-10-04 使用者：「铭牌小传你没写**年龄**和**余寿**啊？」
+    #   数据不在谱牒档里（谱牒只存 `birth`/`death`）—— 而在**实录层**的
+    #   `profiles.Profile`：`age`（活人＝本档当年−生年；已故＝卒年−生年）与
+    #   `yushou`（享年 −(本档当年 − 生年)），共同参照年 `Profile.NOW_YEAR`。
+    #   ⚠️ **在世人物游戏不写卒年、只写 `Ren_End_Old`（享年）** ⇒ 只从谱牒算会
+    #      得出「—」（`table_view` 2026-09-26 踩过同一个坑）。故按姓名去实录层取。
+    if _pf is not None:
+        _age = _pf.age
+        _ys = _pf.yushou
+        if _age is not None:
+            life.append(("年龄", str(_age)))
+        if _ys is not None:
+            life.append(("余寿", str(_ys)))
 
     rel = []
     # ★ 2026-09-21 使用者要求「女性角色名字在任何地方都标红」——

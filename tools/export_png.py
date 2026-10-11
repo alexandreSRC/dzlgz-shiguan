@@ -143,11 +143,20 @@ def _text_w(txt, font):
 
 
 def _dashed_poly(dr, pts, fill, width=1, dash=(4, 3)):
-    """PIL 没有虚线图元 —— 沿折线按「实 dash[0] px / 空 dash[1] px」自绘。"""
+    """PIL 没有虚线图元 —— 沿折线自绘。
+
+    ★ 2026-10-11：从「只认两段 `(实, 空)`」**推广成任意偶数段**（与 Tk 的 `dash`
+      同义：依次是 实/空/实/空… 的像素长度）。为什么必须改：屏幕上「推定世系」
+      用的是**点划线 `(7,3,1,3)`**，导出要与它同款，两段版会 `ValueError`。
+    """
     if len(pts) < 2:
         return
-    on, off = dash
-    period = max(1e-6, float(on) + float(off))
+    pat = [float(x) for x in dash]
+    if len(pat) % 2:                      # 奇数段：补一个 0（Tk 同样容错）
+        pat.append(0.0)
+    if not pat or sum(pat) <= 0:
+        return
+    period = sum(pat)
     phase = 0.0
     for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
         dx, dy = x2 - x1, y2 - y1
@@ -158,8 +167,12 @@ def _dashed_poly(dr, pts, fill, width=1, dash=(4, 3)):
         t = 0.0
         while t < seg:
             p = (phase + t) % period
-            if p < on:
-                run = min(on - p, seg - t)
+            acc, idx = 0.0, 0
+            while idx < len(pat) and acc + pat[idx] <= p:
+                acc += pat[idx]
+                idx += 1
+            if idx < len(pat) and idx % 2 == 0:      # 偶数段 = 实
+                run = min(pat[idx] - (p - acc), seg - t)
                 dr.line([x1 + ux * t, y1 + uy * t,
                          x1 + ux * (t + run), y1 + uy * (t + run)],
                         fill=fill, width=width)
@@ -475,7 +488,7 @@ def tiles_to_pdf(files, pdf_path, resolution=100):
 
 
 def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
-                band_h=_BAND_H, on_progress=None, pdf=True):
+                band_h=_BAND_H, on_progress=None, pdf=True, pdf_only=False):
     """把谱牒 `book` 的整块代际画布渲染成 PNG（大谱自动分块 + PDF）。
 
     返回 (files, pdf_path)；files = [(文件, 宽, 高), ...]。
@@ -490,6 +503,11 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
     people = storage.load_save(book)[0]
     lay = compute_layout(people, scale=scale)
     tiers = jue.tier_colors_for(people)
+    # ★ 2026-10-11 使用者：「导出的图片上还标有**灰色填充铭牌**（显示死亡），
+    #   但**全谱是不需要显示死亡的**（没有标准时间；以后出新剧本还要续全谱）」
+    #   ⇒ 与界面**同一口径**：谱牒自己声明了 `hide_dead_shade` 就不涂灰
+    #   （判据唯一实现在 `storage.hide_dead_shade`，《全史存档》= True）。
+    hide_dead = storage.hide_dead_shade(book)
 
     W = int(lay.scroll_x) + 260
     H = int(lay.scroll_y_end) + 60
@@ -499,14 +517,31 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
     font_gen = _font(max(9, int(13 * scale)))
     font_note = _font(max(7, int(9 * scale)))
     font_badge = _font(max(7, int(8 * scale)))
+    font_guess = _font(max(9, int(10 * scale)))   # 「推定世系」小字
+    font_sym = _font(max(9, int(15 * scale * 0.7)))   # 同代人符号 ♥ / 友
 
     outdir = os.path.join(ROOT, outdir, book)   # ★ 按谱分子目录
     os.makedirs(outdir, exist_ok=True)
+    # ★ 2026-10-11：`--pdf-only` 时把中间分块写进**临时子目录**，拼完整目录删掉
+    #   —— 不留在用户眼皮底下（拼装前不能删：PIL 是逐块读文件的）。
+    png_dir = os.path.join(outdir, "_tiles_tmp") if pdf_only else outdir
+    if pdf_only:
+        os.makedirs(png_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
 
     n_cols = max(1, math.ceil(W / tile))
     n_rows = max(1, math.ceil(H / tile))
     cw, chh = math.ceil(W / n_cols), math.ceil(H / n_rows)
+    # ★ 2026-10-11：跨树夫妻 U 型线的「一对只画一颗♥」判重集（与屏幕 `tree_view` 同规）——
+    #   夫妻已由 U 线正式相连时，挂靠那一侧就**不再画心**（否则一对夫妻两颗心）。
+    _sp_line = theme.spouse_line or theme.spouse
+    u_pairs = set()
+    for _n2, _r2 in people.items():
+        for _s2 in ((_r2.get("spouses") or [])):
+            if _s2 in lay.positions:
+                u_pairs.add(frozenset((_n2, _s2)))
+    _assoc = getattr(lay, "associate_groups", {}) or {}
+    _sym = max(6, int(15 * scale * 0.7))     # 同代人符号（♥/友）字号
 
     files = []
     total = n_cols * n_rows
@@ -517,10 +552,10 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
             x0, x1 = ci * cw, min((ci + 1) * cw, W)
             y0, y1 = ri * chh, min((ri + 1) * chh, H)
             tw, th = x1 - x0, y1 - y0
-            fp = os.path.join(outdir, f"{book}_代际_{stamp}"
+            fp = os.path.join(png_dir, f"{book}_代际_{stamp}"
                                       f"_r{ri + 1}c{ci + 1}.png") \
                 if total > 1 else \
-                os.path.join(outdir, f"{book}_代际_{stamp}.png")
+                os.path.join(png_dir, f"{book}_代际_{stamp}.png")
             sp = StreamingPNG(tw, th, fp)
 
             n_bands = max(1, math.ceil(th / band_h))
@@ -530,6 +565,9 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
                     by1 = min(by0 + band_h + _OVERLAP, y1)
                     band = Image.new("RGB", (tw, by1 - by0), PAPER)
                     dr = ImageDraw.Draw(band)
+                    # 本带内的「一对只画一次」判重（挂靠心 / 夫妻 U 线）——**每带重置**：
+                    # 各带是独立画布，跨带的线必须在每条带上都画一遍才不断。
+                    _paired = set()
 
                     def Y(v):
                         return v - by0
@@ -548,8 +586,23 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
                         if n not in lay.positions:
                             continue
                         x, y = lay.positions[n]
-                        if not (x0 - nw - 20 <= x <= x1 + nw + 20
-                                and by0 - 40 <= y <= by1 + 40):
+                        if not (x0 - nw - 20 <= x <= x1 + nw + 20):
+                            continue
+                        # ★★ 2026-10-11 使用者：「图里有些线没画，比如**姜尚的儿子跟姜尚**」。
+                        #   真因：连线原来只在**子节点所在的那条带**里画（判据只看 `y`），
+                        #   可姜丁(3199,4716) 与姜尚(4716,4622) 横向差 **1517px**、是条
+                        #   **斜长线**，纵跨两三条带 ⇒ 其余带上**根本没画** ⇒ 看着断开。
+                        #   ⇒ 判据改成看**连线自身的 y 跨度**（本人 + 父/母/推定父/配偶），
+                        #   只要跨度与本带相交就画 —— 长线在它经过的每条带上都补齐。
+                        _ys = [y]
+                        for _k in ("father", "mother", "father_guess"):
+                            _p = str(r.get(_k) or "")
+                            if _p and _p in lay.positions:
+                                _ys.append(lay.positions[_p][1])
+                        for _p in (r.get("spouses") or []):
+                            if _p in lay.positions:
+                                _ys.append(lay.positions[_p][1])
+                        if min(_ys) - nh > by1 + 40 or max(_ys) + nh < by0 - 40:
                             continue
                         f = str(r.get("father") or "")
                         m = str(r.get("mother") or "")
@@ -565,12 +618,80 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
                             dr.line([X(mx), Y(my + nh / 2),
                                      X(x), Y(y - nh / 2)],
                                     fill=theme.spouse, width=1)
-                        if g in lay.positions and not f and \
+                        if g in lay.positions and g != f and \
                                 x0 <= lay.positions[g][0] <= x1:
                             gx, gy = lay.positions[g]
-                            dr.line([X(gx), Y(gy + nh / 2),
-                                     X(x), Y(y - nh / 2)],
-                                    fill=theme.text_3, width=1)
+                            # ★★ 2026-10-11 使用者：「导出画布上**为什么没看到虚接线和
+                            #   注明的虚接小字**？」—— 原来这里只画一条 **1px 灰色实线**：
+                            #   在 1.3 亿像素的大图上等于看不见；小字干脆没画。
+                            #   ⇒ 改成与**屏幕同一画法**（`tree_view` 3b 层）：
+                            #   **点划线 `(7,3,1,3)` + 两端圆点 + 中间「推定世系」小字**，
+                            #   粗细 `max(2, 1.8×scale)`（随倍率放大，3.0 倍下 5px）。
+                            #   ⚠️ 导出没有"选中态"，所以**每条都带字**（屏上只给选中那条）。
+                            gp = [(X(gx), Y(gy + nh / 2)),
+                                  (X(x), Y(y - nh / 2))]
+                            gw = max(2, int(1.8 * scale))
+                            _dashed_poly(dr, gp, theme.text_3, width=gw,
+                                         dash=(7, 3, 1, 3))
+                            rd = max(2, int(2.6 * scale))
+                            for _px2, _py2 in gp:
+                                dr.ellipse([_px2 - rd, _py2 - rd,
+                                            _px2 + rd, _py2 + rd],
+                                           fill=theme.text_3)
+                            dr.text(((gp[0][0] + gp[1][0]) / 2,
+                                     (gp[0][1] + gp[1][1]) / 2), "推定世系",
+                                    fill=theme.text_3, font=font_guess,
+                                    anchor="mm")
+                        # ---- ★★ 2026-10-11 补：同代人符号（挂靠：♥ / 友）------
+                        #   使用者：「补上挂靠符号」。原来 `render_book` **一个都没画**
+                        #   （《全史存档》369 人挂靠）。画法与屏幕 `tree_view` 同款：
+                        #   · 位置：两卡中点、**两卡下沿之下**（`bottom_y`），
+                        #     同一锚下多个配偶按 `associate_groups` 的次序横向散开；
+                        #   · `associate_type == "spouse"` → 红 **♥**，否则 → **友**（accent 色）；
+                        #   · **夫妻已由 U 线相连的不再画心**（`u_pairs` 判重）——
+                        #     否则一对夫妻两颗心（屏幕踩过这个坑，2026-10-03）。
+                        _ref = str(r.get("associate_of") or "")
+                        # ⚠️ 判据与屏幕**逐字同款**（两边一起修）：`associate_type`
+                        #   **字段不存在**时不能当 clan —— 只有主程序/自动关注写的
+                        #   宗主族人挂靠才显式标 "clan"（`main.py` 2620「算族人（不画♥）」），
+                        #   而 `tools/guess_lineage.py` 的同代人挂靠**不写这个字段**，
+                        #   五十五批口径明写「挂靠（同代人）→ 同排 + **「友」标**」。
+                        #   实测《全史存档》351 条挂靠**全部缺这个字段** ⇒ 缺/空一律当「友」。
+                        _atype = str(r.get("associate_type") or "friend")
+                        if _ref and _ref != n and _ref in lay.positions \
+                                and _atype != "clan" \
+                                and frozenset((n, _ref)) not in u_pairs:
+                            _rx, _ry = lay.positions[_ref]
+                            _ws = _assoc.get(_ref) or [n]
+                            _k = len(_ws)
+                            _i = _ws.index(n) if n in _ws else 0
+                            _mx = ((_rx + x) / 2
+                                   + (_i - (_k - 1) / 2.0) * _sym * 1.6)
+                            _by = max(_ry, y) + nh / 2 + 1 + _sym / 2
+                            dr.text((_mx, _by),
+                                    "♥" if _atype == "spouse" else "友",
+                                    fill=(theme.spouse if _atype == "spouse"
+                                          else theme.accent),
+                                    font=font_sym, anchor="mm")
+                        # ---- ★★ 2026-10-11 补：跨树夫妻 U 型线 + ♥ --------------
+                        #   使用者：「补上跨树夫妻线」。屏幕是 U 型（下探 `8×scale`
+                        #   再上来）+ 中点一颗♥；一对只画一次（`_paired` 判重）。
+                        for _s in (r.get("spouses") or []):
+                            _key = frozenset((n, _s))
+                            if _s not in lay.positions or _key in _paired:
+                                continue
+                            _paired.add(_key)
+                            _sx, _sy = lay.positions[_s]
+                            _b1, _b2 = y + nh / 2, _sy + nh / 2
+                            _dy = max(_b1, _b2) + 8 * scale
+                            _uw = max(1, int(1.5 * scale))
+                            _dashed_poly(dr,
+                                         [(X(x), Y(_b1)), (X(x), Y(_dy)),
+                                          (X(_sx), Y(_dy)), (X(_sx), Y(_b2))],
+                                         _sp_line, width=_uw, dash=(4, 2))
+                            dr.text(((X(x) + X(_sx)) / 2, Y(_dy) + 2 * scale),
+                                    "♥", fill=_sp_line, font=font_sym,
+                                    anchor="ma")
 
                     for n, (x, y) in lay.positions.items():
                         if not (x0 <= x <= x1
@@ -579,7 +700,7 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
                         r = people.get(n) or {}
                         base, dup = _split_dup(n)
                         tier = tiers.get(n, "")
-                        dead = bool(r.get("death"))
+                        dead = bool(r.get("death")) and not hide_dead
                         female = r.get("gender") == "女"
                         color = theme.tier.get(tier, theme.text)
                         if female:
@@ -598,10 +719,16 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
                                           int((nh - 8) /
                                               max(1, len(base)))))
                         vfont = ImageFont.truetype(font_name.path, size)
-                        cy = y - size * len(base) / 2
+                        # ★★ 2026-10-11 使用者报「**导出的画布（全史存档 PDF）上面没有字**」：
+                        #   真因就在这里 —— 姓名与尊号是**唯二**用**未偏移坐标**画的文字，
+                        #   而整图是**按 400px 条带**分段渲染的（每条带一张小图，`Y(v)=v-by0`）。
+                        #   从第 2 条带起 `by0 > 0` ⇒ 文字被画到条带画布之外、**直接被裁掉**
+                        #   ⇒ 只有第 1 条带那条能看见名字，整张导出图看着"没有字"。
+                        #   （框、「史」徽标、封代数字都用了 `X()/Y()`，所以它们都在。）
+                        cy = Y(y) - size * len(base) / 2
                         for ch in base:
                             wch = dr.textlength(ch, font=vfont)
-                            dr.text((x - wch / 2, cy), ch,
+                            dr.text((X(x) - wch / 2, cy), ch,
                                     fill=color, font=vfont)
                             cy += size
                         if dup:
@@ -611,7 +738,7 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
                         if note:
                             nf = ImageFont.truetype(
                                 font_note.path, max(8, int(size * 0.45)))
-                            ny = y - nf.size * min(4, len(note)) / 2
+                            ny = Y(y) - nf.size * min(4, len(note)) / 2
                             for ch in note[:4]:
                                 wch = dr.textlength(ch, font=nf)
                                 dr.text((right + 8, ny), ch,
@@ -635,7 +762,17 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
                     raw = bytearray()
                     rows = band.tobytes()
                     stride = tw * 3
-                    for ry in range(band.height):
+                    # ★★ 2026-10-11（本条是"位置全错"的真凶）：条带带 **90px 重叠**
+                    #   （`_OVERLAP`，为的是跨带的铭牌/文字两带各画一次、接缝不缺），
+                    #   但喂进 PNG 流时**把重叠那 90 行也重复写了一遍** ⇒ 每过一条带，
+                    #   画面就往下多走 90 行 ⇒ **整图被纵向拉长 1.225 倍、且随条带累积
+                    #   错位**（实测：布局 y=2123 的卡片跑到流里的 y≈2573；底部还超出
+                    #   IHDR 声明的高度被丢掉）。按 `Y()` 画的图元全被这一条带偏，
+                    #   这也是"按坐标去图上找东西找不到"的原因。
+                    #   ⇒ 第 2 条带起**跳过开头 `_OVERLAP` 行**（那段上一带已经写过，
+                    #     且写在同一位置），拼起来才与布局坐标 1:1 对齐。
+                    _skip = 0 if bi == 0 else min(_OVERLAP, band.height)
+                    for ry in range(_skip, band.height):
                         raw += b"\x00"
                         raw += rows[ry * stride:(ry + 1) * stride]
                     sp.feed(raw)
@@ -653,6 +790,15 @@ def render_book(book, outdir="导出画布", scale=DEFAULT_GEN_SCALE, tile=9000,
         except Exception as e:
             print(f"PDF 拼装失败（PNG 已生成）: {e}")
             pdf_path = None
+    if pdf_only and pdf_path:
+        # ★ 2026-10-11 使用者：「**只需要 1 个文件即可，分片的 png 自己删除**」
+        import shutil as _sh
+        try:
+            _sh.rmtree(png_dir)
+            print("  （中间分块已随临时目录删掉，只留 PDF）")
+        except OSError as e:
+            print(f"  （临时分块目录删除失败，可手动删 {png_dir}：{e}）")
+        files = []
     return files, pdf_path
 
 
@@ -662,9 +808,35 @@ def main():
     ap.add_argument("--scale", type=float, default=DEFAULT_GEN_SCALE)
     ap.add_argument("--tile", type=int, default=9000)
     ap.add_argument("--outdir", default="导出画布")
+    # ★ 2026-10-11 使用者：「只需要 1 个文件即可，分片的 png 自己删除」
+    ap.add_argument("--pdf-only", action="store_true",
+                    help="只留 PDF，拼完自动删掉中间分块 PNG")
+    # ★ 2026-10-11 使用者：「感情拼接你全给我**竖着拼接 pdf** 了……那张 png 是**一整张画布**」
+    #   ⇒ 加 `--single`：**不切块**，出**一整张画布**的 PNG（= `--tile` 设成大于画布）。
+    #   同时**不生成 PDF** —— 整张画布 197808×29232 px，做单页 PDF 要把它整幅读进内存
+    #   （≈17 GB）必 OOM；而分块多页 PDF 在阅读器里就是**竖着堆**，正是他不想要的。
+    ap.add_argument("--single", action="store_true",
+                    help="整张画布一张 PNG（不切块、不出 PDF）")
+    # ★ 2026-10-11 使用者：「最后**时间家谱也出个 png**」—— `render_timeline` 早就写好，
+    #   只是 CLI 一直没有入口（以前多半是走界面导出）。
+    ap.add_argument("--mode", choices=("gen", "timeline"), default="gen",
+                    help="gen=代际家谱（默认）· timeline=时间家谱")
     a = ap.parse_args()
+    if a.mode == "timeline":
+        t0 = time.time()
+        files = render_timeline(a.book, a.outdir,
+                                on_progress=lambda d, t:
+                                print(f"\r{d}/{t}", end=""))
+        print("\n时间家谱：%s（%d×%d）· 耗时 %.0fs"
+              % (os.path.basename(files[0][0]), files[0][1], files[0][2],
+                 time.time() - t0))
+        return
+    if a.single:
+        a.tile = 10 ** 9
     t0 = time.time()
     files, pdf = render_book(a.book, a.outdir, a.scale, a.tile,
+                             pdf=not a.single,
+                             pdf_only=a.pdf_only,
                              on_progress=lambda d, t:
                              print(f"\r{d}/{t}", end=""))
     dt = time.time() - t0

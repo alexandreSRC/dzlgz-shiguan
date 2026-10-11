@@ -13,7 +13,7 @@ from tkinter import ttk
 
 from .. import catalog as C
 from ..widgets.kit import Card, input_box
-from .person_view import PersonView, Tooltip
+from .person_view import PersonView, Tooltip, _DynTip
 
 
 class WorldView(PersonView):
@@ -54,12 +54,96 @@ class WorldView(PersonView):
         ent.bind("<Return>", lambda e: self._apply_filter())
         self.search_var.trace_add("write", lambda *a: self._apply_filter())
         self.search_entry = ent
+        # ★ 2026-10-03 修（做「神明 · 总表」时逮到）：`PersonView._apply_filter()`
+        #   在**非人物表族**分支末尾要写「命中 N 条」，但那个 `hit_lbl` 是**人物页
+        #   侧栏**建的（person_view.py:521），世界页侧栏是另一套实现 ⇒ 每点一次
+        #   表族都抛 `AttributeError`，被 Tk 的回调机制**静默吞掉**（`_render_table`
+        #   在抛之前已跑完，所以表格照样显示，一直没人发现；只是搜索计数永远不出现）。
+        #   这里补上同款标签 —— 与搜索框同容器、`anchor="w"` 汉字左对齐。
+        self.hit_lbl = tk.Label(self.card_search.body, text="", anchor="w",
+                                bg=th.bg_card, fg=th.accent,
+                                font=(th.font_ui_fallback, th.fs_body_sm, "bold"))
+        self.hit_lbl.pack(fill=tk.X, pady=(2, 0))
         self.show_generated = tk.BooleanVar(value=True)   # 世界页无此概念，占位
         self.follow_lbl = tk.Label(self.card_search.body, text="", bg=th.bg_card)
 
     def status_gen_text(self):
         n = len(self.slot.tables) if self.slot else 0
         return f"世界 {n} 个表族"
+
+    # ---- 详情卡「游戏世系」：逐个君主一行 -------------------------------
+    # ★ 使用者 2026-10-06 口径：「详情卡的**世系**，改名为**游戏世系**，
+    #   **每个君主占一行**，谥号、在位年数写名即可」。
+    #   语义 = 游戏自己记的历代君主实录（始祖→…→现任），**不是**我们推的世系。
+    def _field_line(self, key, val):
+        if key == "King_Str":
+            return self._king_line_field(val)
+        return super()._field_line(key, val)
+
+    def _king_line_field(self, val):
+        """「游戏世系」= 一张**内嵌表**：君主 | 姓 | 谥号 | 爵 | 在位年，每君一行。
+
+        为什么用表不用一串文字：三位君主挤进一个标签会溢出被裁（违反「无汉字被遮盖」），
+        而「表格思维」要求单元格大小定死。
+        """
+        from ..gongqing import king_rows
+        t = self.theme
+        line = tk.Frame(self.detail_inner, bg=t.bg_panel)
+        line.pack(fill=tk.X, padx=6, pady=1)
+        line.columnconfigure(0, weight=0, minsize=getattr(self, "_label_px", 0))
+        line.columnconfigure(1, weight=1)
+        lb = tk.Label(line, text="游戏世系", bg=t.bg_panel, fg=t.text_3, anchor="w",
+                      justify=tk.LEFT,
+                      font=self.font(t.font_ui_fallback, t.fs_body_sm)
+                      )
+        lb.grid(row=0, column=0, sticky="nw")
+        # ★ 2026-10-06 使用者：「先任君主那一列不是说不要了吗」—— 表格里那列
+        #   已撤（136/137 国都是「缺」，白占 86px）。**这里是它唯一的出口**：
+        #   倒数第二行就是先任君主，悬停说清，省得再单独占一列。
+        Tooltip(lb, "游戏世系＝**游戏自己记的历代君主实录**，从始祖到现任，"
+                    "一行一位（姓 / 谥号 / 爵 / 在位年）。\n"
+                    "顺序由远到近，**最后一行是现任，倒数第二行是先任君主**。\n"
+                    "这不是本工具推算的世系，故名「游戏世系」。\n"
+                    "「缺」＝游戏没记这位君主（实测 137 国里 33 国如此）。")
+
+        rows = king_rows(val)
+        if not rows:
+            # ★ 使用者 2026-10-06 定案：无世系串（实测 33/137 国，多是叛军/新立国）
+            #   一律写「**缺**」—— 明确告诉使用者"这个字段游戏没写"，不是空白也不是猜。
+            tk.Label(line, text="缺", bg=t.bg_panel, fg=t.text_3, anchor="w",
+                     font=self.font(t.font_note, t.fs_body_sm)
+                     ).grid(row=0, column=1, sticky="w", padx=(2, 0))
+            return
+
+        host = tk.Frame(line, bg=t.bg_panel)
+        host.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+        # 四列按内容定宽：君主名 / 姓 / 谥号 / 爵 / 在位年
+        for c, w in enumerate((0, 0, 0, 0)):
+            host.columnconfigure(c, weight=0)
+        host.columnconfigure(4, weight=1)
+        # 数字用 Arial、中文用中文字体（口径：字号统一，层级只靠加粗）
+        f_ui = self.font(t.font_ui_fallback, t.fs_body_sm)
+        f_b = self.font(t.font_ui_fallback, t.fs_body_sm, "bold")
+        heads = ("君主", "姓", "谥号", "爵", "在位年")
+        for c, h in enumerate(heads):
+            tk.Label(host, text=h, bg=t.bg_panel, fg=t.text_3, anchor="w",
+                     font=f_b).grid(row=0, column=c, sticky="w",
+                                    padx=(0, 8) if c < 4 else (0, 0))
+        for r, (nm, xing, shi, jue, span) in enumerate(rows, start=1):
+            # ★ 2026-10-06 使用者：「你把游戏世系的**标绿**干啥？」
+            #   原来给现任上了 `t.accent`（青绿）—— **违反配色语义**：
+            #   `accent` 是「选中」的专用色（紫=选定/青绿=查阅层），
+            #   拿它标「现任」等于让「现任」看起来像「被选中」，两件事混了。
+            #   层级只靠**加粗**（口径：字号统一，层级只靠加粗），现任再加一个「现任」表头说明。
+            cur = (r == len(rows))
+            fb = f_b if cur else f_ui
+            cells = (nm, xing or "—", shi or "—", jue or "—", span or "—")
+            for c, s in enumerate(cells):
+                tk.Label(host, text=s, bg=t.bg_panel,
+                         fg=t.text if c == 0 else t.text_2, anchor="w",
+                         font=fb if c == 0 else f_ui
+                         ).grid(row=r, column=c, sticky="w",
+                                padx=(0, 8) if c < 4 else (0, 0))
 
     def toolbar_groups(self):
         """工具栏分组（2026-09-23 UI 重规划）：数据 → 帮助（与人物页同位）。"""
@@ -84,6 +168,11 @@ class WorldView(PersonView):
         """
         if self.slot is None:
             return []
+        # ★ 2026-10-03：「神明 · 总表」是**派生表** —— 46 位神明不在存档的表族里，
+        #   埋在 `Save_Controller_Data` 的嵌套 `Gods_Arr` / `Gods_Sys_Arr` 中，
+        #   进导航前先摊平挂上（幂等）。做法与《全史存档》「人物 · 谱牒总谱」一致。
+        from .. import gods as GD
+        GD.attach_table(self.slot)
         groups = {}
         for name, t in self.slot.tables.items():
             if name in self.PERSON_ORDER or name.startswith("_"):
@@ -122,7 +211,10 @@ class WorldView(PersonView):
                     self._nav_note[kid] = f"{lbl}\n{note}"
         tip = getattr(self, "_nav_tip", None)
         if tip is None:
-            tip = Tooltip(self.nav, "")
+            # ★ 2026-10-06 复核修：原来 `Tooltip(self.nav, "")` 空文本时
+            #   kit.tip 直接返回控件本身 ⇒ `.text = ...` 从未生效过——
+            #   「表族悬停看用途」自上线起就没显示过。换 `_DynTip`（动态文本）。
+            tip = _DynTip(self.nav, follow_mouse=True)
             self._nav_tip = tip
 
             def _follow(e):
@@ -130,7 +222,8 @@ class WorldView(PersonView):
                     iid = self.nav.identify_row(e.y)
                 except Exception:
                     iid = ""
-                tip.text = self._nav_note.get(iid, "") if iid else ""
+                tip.poke(self._nav_note.get(iid, "") if iid else "",
+                         e.x_root, e.y_root)
             self.nav.bind("<Motion>", _follow, add="+")
 
     def _show_help(self):
@@ -170,8 +263,14 @@ class WorldView(PersonView):
             "【继承规则】（同上来源）分封附庸按「**族域—神系**」配对继承，\n"
             "　不必然继承母国；叛军仍继承母国。原配对（中夏—皇天）在当地族域国家\n"
             "　全灭后可能被「新配对」取代（如中夏—烛龙）。\n\n"
-            "⚠️ 以上「神系」段落的机制来自玩家 **念不勿** 的 TapTap 攻略\n"
-            "　《关于非上古剧本神系清零流程及相关设定》（2025-12-24 修订）。\n"
-            "　作者本人声明「测试结果常被官方调整、时效性不保证」，\n"
-            "　**请以游戏内实际表现与官方说明为准**；本工具只做字段呈现，不参与战斗规则。\n\n"
+            "【神明 · 位阶与威能上限】（来源 ②）\n"
+            "　· 威能上限 = 位阶上限 与「神格对应的全部威能数」取较小者\n"
+            "　· 位阶上限：主神 3 · 佐神 1~2 · 护法神 / 使神 1\n"
+            "　· 皇天一系例外：全是单神格，上限不受位阶约束；后尊神明恒 1 神格 1 威能\n"
+            "　· 奇观「五畤原」供奉者上限 +1、位阶显示变「主神」；「消除所有灾害」不含火灾\n"
+            "　· 带 * 的神：初始威能少于全部威能。五系 46 位神见侧栏「国家 · 神明 · 总表」\n\n"
+            "⚠️ 以上「神系 / 神明」两段取自两位玩家的 TapTap 攻略：念不勿《神系清零流程\n"
+            "　及相关设定》（2025-12-24 修订）、永生人类《各族域初始神明的神格与威能》\n"
+            "　（09-24 修订，五系 46 位神逐条转录）。两位均声明「常被官方调整、\n"
+            "　时效性不保证」，**请以游戏内实际表现与官方说明为准**；本工具只做字段呈现。\n\n"
             "【只读】实录层不提供任何写盘功能，不会改动你的游戏存档。")

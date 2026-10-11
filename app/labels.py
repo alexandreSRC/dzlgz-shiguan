@@ -20,7 +20,11 @@ import re
 # ★ 2026-09-29：神系（`Faith_Gods_Sys_Code`）码表的**单一来源**在 `app/gods.py`
 #   —— 那边连同神名、神明效果、庙宇容量公式、造神条件一起存着。
 #   `gods` 不 import 本模块，故不会循环导入。
-from .gods import GOD_SYS_BY_CODE
+from .gods import GODHOOD, GOD_SYS_BY_CODE, WEI_NENG
+# ★ 2026-10-03：政策 / 能力的「编号 → 名」表在 `names_map` 里（1637 + 116 条，由
+#   `tools/scan_number_map.py` 从存档反解）。`names_map` **零依赖**（纯数据 + 几个
+#   查询函数），所以这里直接引它的码表，**不另抄一份** —— 单一来源。
+from .names_map import NENG_LI_CODES, ZHENG_CE_CODES
 
 # ============================================================ 一、字段中文名
 # 覆盖 _stats/leafnames.txt 里实测出现过的全部字段名。
@@ -100,21 +104,31 @@ FIELD = {
     "Zi_Jian_Guan_Lian_Data": "自建关联数据", "He_Ren_Zu_Yu": "融合族域",
 
     # ---------------------------------------------------------- 国家
-    "King_Code": "国编号", "King_Name": "国名", "King_Str": "国世系",
-    "King_Colore": "国色", "King_Guo_Du_Code": "国都编号", "King_Jue_Wei_Code": "爵位",
+    # ★ 2026-10-06 使用者裁定：「国姓」**不改名** —— 游戏怎么写的就怎么定。
+    #   `Guo_Xing` 存的是**现任君主的姓**（实测 8/8 跟现任，秦=姬因现任韩广姬姓），
+    #   不是立国本姓（秦应为嬴）。忠于存档原文，不做推导。
+    "King_Code": "国编号", "King_Name": "国名", "King_Str": "游戏世系",
+    "King_Colore": "国色", "King_Guo_Du_Code": "都城", "King_Jue_Wei_Code": "爵位",
     "King_Stage": "发展阶段", "King_Stage_Record": "阶段记录",
     "Is_King_Stage_Jin_Jie": "阶段是否晋升", "Guo_Xing": "国姓", "Guo_Shi": "国氏",
     "Zhou_Name": "州名", "Zu_Yu": "族域", "Nian_Hao": "年号", "Jian_Guo_Year": "建国年",
     "King_Tian_Ming": "天命", "Tian_Ming_Value": "天命值", "King_Zheng_Tong": "正统",
     "King_Wei_Wang": "威望", "King_Jun_Wei": "军威", "King_Wen_Ding": "问鼎",
     "King_Kuan_Xiang": "库项", "King_Xian_Neng_Total": "贤能总数",
-    "King_Last_Ren_Total": "人口总数", "King_Last_Ren_Code": "末代国君",
+    "King_Last_Ren_Total": "人口总数", "King_Last_Ren_Code": "现任国君",
+    #★ 2026-10-06：曾加过一个派生键 `_King_Prev_Ruler`（「先任君主」），
+    #   **已按使用者要求撤掉** —— 实测 137 国里只有秦国发生过易代，
+    #   其余 136 国都是首任建国 ⇒ 整列都是「缺」，白占 86px。
+    #   先任君主在**详情卡的「游戏世系」倒数第二行**就是，不必单独占一列。
     "King_Last_Liang": "存粮", "King_Bing_Li_Total": "兵力总数",
     "King_Lao_Yi_Total": "劳役总数", "King_Shui_Lu": "税率",
     "King_Money_Shui_Lu": "钱税", "King_Lao_Yi_Lu": "劳役率",
     "King_Zheng_Bing_Lu": "征兵率", "King_Yi_Yong_Lao_Yi": "已用劳役",
     "King_Me_Ke_Max": "门客上限", "King_Liang_Shi_Add": "粮食加成",
-    "King_Kill_Old": "弑君数", "King_Du_Li": "都鄙", "King_Quan_Bing": "权柄",
+    # ★ 2026-10-06 使用者定案：「**弑君数**」这个词不准 —— 它就是
+    #   **君主易代次数**（该国有过几次君主更替）。字段名 `King_Kill_Old`
+    #   是游戏自己的叫法，标签按使用者口径改。
+    "King_Kill_Old": "易代次数", "King_Du_Li": "都鄙", "King_Quan_Bing": "权柄",
     "King_Chu_Jun": "出军", "King_Ren": "国人", "King_Ren_Wang_Base": "国人王基",
     "King_Is_Na_Gong": "是否纳贡", "King_Last_Fa_Zhan_Total": "发展总值",
     "King_Last_Jun_Wei_Total": "军威总值", "King_Last_Tian_Ming_Total": "天命总值",
@@ -150,7 +164,7 @@ FIELD = {
     "Quan_Ju_Tong_Zhi_Ji_Lu": "全局统治记录", "Jiu_Zhou_Tong_Zhi_Ji_Lu": "九州统治记录",
     "Ge_Ju_Record_Parent_King_Name": "割据记录 · 母国名",
     "Last_Guo_Du_Bei_Zhan_Time": "上次国都被占时间",
-    "Last_Di_Fang_Pan_Luan": "上次地方叛乱", "Last_King_Ren_Kill_Time": "上次弑君时间",
+    "Last_Di_Fang_Pan_Luan": "上次地方叛乱", "Last_King_Ren_Kill_Time": "上次易代时间",
     "Last_Zhan_Ling_King_Array": "上次占领国表", "Last_Ji_Xian_Array": "上次祭天表",
     "Xiong_Di_Zhu_She_Time": "兄弟煮社时间", "Zheng_Zhao_Fan_Wei": "征召范围",
     "Pei_Du_Jin_Jun_Max_Num": "陪都禁军上限", "Tan_Suo_Huang_Fei_City_Set": "探索荒废城集合",
@@ -445,6 +459,172 @@ FIELD = {
     "Jin_Start_King": "进度起始国", "Jin_Xing_Num": "进行数",
     "Student": "学生", "Teacher": "教师", "All_Prop_Arr": "全部道具表",
     "Prop_Code": "道具编号", "Store_Code": "库房编号",
+    # ★ 2026-10-03：`Save_All_Store_Obj_Arr` 里唯一的漏译字段（全仓扫过，只此一个）。
+    #   译名与上一条 `Store_Code`「库房编号」同口径。
+    "Warehouse": "库房",
+
+    # ════════════ 2026-10-03 补译：世界页「中文标签里混 ASCII」的字段 ════════════
+    #   使用者要求「把英文单词或中文拼音尽量输出成中文词语，建立对等关系」。
+    #   实测：词根兜底对**没登记的复合名**会半译出 `MiaoOpen类型` / `WenHuaSpeed`
+    #   / `Cur比` / `System编号` 这种**中英夹杂垃圾**（比原样英文还糟）。
+    #   这里按「拼音直读 + 同表同级键上下文」补全；译名沿用项目既有口径
+    #   （如 `Store_Code`→库房编号 ⇒ 库房；`_p:` 前缀的派生列另有规矩）。
+    #   —— 世界页（`Res_Allocation` / `New_Save_Map_Data` / `Save_All_Store_Obj_Arr`）
+    "weight": "权重", "surplus": "盈余", "consumed": "已耗", "flag": "标记",
+    "Fixed": "固定", "Flexible": "浮动", "Above": "上级",
+    "Cur_Rate": "当前比率", "System_Code": "系统编号",
+    "Wen_Hua_Speed": "文化速度", "Wen_Hua_Number": "文化数量",
+    "Wen_Hua_Year": "文化年份", "Xing_Fa_Array": "刑罚表",
+    "Can_Change_Zhao_Xiang": "可否改招降", "Can_Zhao_Xiang": "可否招降",
+    "Miao_Open_Type": "庙开放类型", "Zheng_Ce_End": "政策结束",
+    "Guo_Li": "国力", "King_Color": "国君颜色",
+    "Weapon_array": "武器表", "Weapon_Code": "武器编号", "Weapon_Num": "武器数量",
+    "Res_Point_Type_Code": "资源点类型编号", "Res_Point_Type_Name": "资源点类型",
+    "Res_Point_Code": "资源点编号", "Res_Point_Level": "资源点等级",
+    "In_City_Code": "所在城池编号", "In_City_Name": "所在城池",
+    "Kai_Cai_Nan_Du": "开采难度", "Output_Res": "产出资源",
+    "Res_Reserves": "资源储量", "Prove_State": "验证状态",
+    "Is_Restore": "是否恢复", "Restore_Cycle": "恢复周期",
+    "Ku_Cun_Num": "库存数量", "Total_Xiao_Liang": "总销量",
+    "This_Year_Xiao_Liang": "本年销量", "Jin_Huo_Time": "进货时间",
+    "Sell_Time": "出售时间", "Second_Evaluate": "二次评价",
+    "Administrative_Unit_Type_Code": "行政区类型编号",
+    "Unit_Official_System_Obj": "单位官制对象", "Official_System_Data": "官制数据",
+    # ---- ★ 2026-10-04（第四批，06:21 档）：新出 8 个字段，其中 7 个是**同一张记录**
+    #   的 `Map_Shou_Zai_*` 组（城池**受灾**：表/等级/类型/时间/起始时间/粮比/人比
+    #   —— 组内互相佐证），另 1 个 `Ji_Si_Huo_Mian_Qi_Xian`＝祭祀豁免期限。
+    "Map_Shou_Zai_Array": "城池受灾表", "Map_Shou_Zai_Leve": "城池受灾等级",
+    "Map_Shou_Zai_Type": "城池受灾类型", "Map_Shou_Zai_Time": "城池受灾时间",
+    "Map_Shou_Zai_Start_Time": "城池受灾起始时间",
+    "Map_Shou_Zai_Liang_Bi": "城池受灾粮比", "Map_Shou_Zai_Ren_Bi": "城池受灾人比",
+    "Ji_Si_Huo_Mian_Qi_Xian": "祭祀豁免期限",
+    # ---- ★ 2026-10-04（第三批，05:14 档）：又冒出来 10 个字段名，**成对出现**、互为佐证：
+    #   `Cur_*/Total_*`（当前/合计）、`Start_/End_City`（起始/终点）、
+    #   `Stop_Zhi_Du_Gai_Ge_Code/Time`（同一条记录的编号+时间）。
+    #   `Ren_Zhao_Mu_Ing` 与上一批的 `Ren_Jia_Zu_Zhao_Mu_Ing` 同构（…招募中）。
+    "Cur_Ji_He_Times": "当前集合次数", "Total_Ji_He_Times": "合计集合次数",
+    "Cur_Res": "当前资源", "Total_Res": "合计资源",
+    "Start_City": "起始城池", "End_City": "终点城池",
+    "Last_Gong_Zi_Zheng_Wei": "上次公子争位",
+    "Ren_Zhao_Mu_Ing": "人物招募中",
+    "Stop_Zhi_Du_Gai_Ge_Code": "停止制度改革编号",
+    "Stop_Zhi_Du_Gai_Ge_Time": "停止制度改革时间",
+    # ---- ★ 2026-10-04（第二批）：同一次续谱的另 2 个新字段
+    #   ⚠️ 末尾语段（`Zhu_Hou` / `Jun`）**语义未定，按字面直译，待核** ——
+    #   实测值可佐证前半：`Last_Zhan_Zheng_Yu_Zhu_Hou` 是**时间三元组**
+    #   （`-196,7,17`），`Nv_Jun_Num` 是**数量**（1）。
+    "Last_Zhan_Zheng_Yu_Zhu_Hou": "上次战政域主后",
+    "Nv_Jun_Num": "女军数量",
+    # ---- ★ 2026-10-04：续谱到 `Save_All_1`（03:44 档）后新冒出来的 4 个字段名
+    #   —— 同样由 `tools/check_labels.py` 第 ③ 节自动抓出。译名沿用项目既有口径：
+    #   `Is_*` → 「是否…」（同 `Is_Ever_Jian_Hao`＝是否曾经称号）、
+    #   `*_Ing` → 「…中」（同 `King_Zheng_Ing_Array`＝国政进行中）、
+    #   `Map_*` → 「城池…」（同 `Map_Diu_Shi_Array`＝城池丢失表）。
+    "Is_Change_Pei_Zhi": "是否变更配置",
+    "Map_Guan_Shu_Off": "城池官署关闭",
+    "Map_Xu_Nuo": "城池许诺",
+    "Ren_Jia_Zu_Zhao_Mu_Ing": "人物家族招募中",
+    # ---- ★ 2026-10-03（第二批）：续谱到 `Save_All_1` 后新冒出来的 3 个字段名
+    #   —— 由 `tools/check_labels.py` 第 ③ 节自动抓出（新档一带新字段就亮灯）。
+    #   `Kan_Shou_Num` / `Qiu_Fan_Num` **成对出现**（看守 / 囚犯），互为佐证。
+    "Kan_Shou_Num": "看守数量", "Qiu_Fan_Num": "囚犯数量",
+    "Record_Month": "记录月份",
+    # ---- ★ 2026-10-03：存档里**真带前导下划线**的三个键
+    #   （在 `New_Save_Map_Data/Map_Jie_Ceng_Obj/Jie_Ceng_Map` 里，值分别是
+    #    忠诚 5 / 地区影响 60 / 人口数量 1696）。它们**不是** GUI 派生列，
+    #   但 `field_label` 对 `_` 前缀只会「去掉下划线」⇒ 译出来还是拼音。
+    #   `FIELD` 在函数里是**先于**下划线兜底查的，所以登记在这里就能生效。
+    "_Zhong_Cheng": "忠诚", "_Di_Qu_Ying_Xiang": "地区影响",
+    "_Ren_Kou_Num": "人口数量",
+    # ---- 神明（`Save_Controller_Data` 的 Gods_Arr / Gods_Sys_Arr）★ 本轮新增也要能读
+    "Gods_Base_Data": "神明基础数据", "Gods_Arr": "神明表",
+    "Gods_Sys_Arr": "神系表", "Wei_Ge": "位格", "Wei_Neng_Limit": "威能上限",
+    "Godhood_Code_Arr": "神格", "Passive_Effect": "威能", "Pos_Name": "位阶",
+    "Gods_Code": "神祇编号", "Appear_King": "所属王朝",
+    "Hou_Yi_Zu_Xing": "后裔族姓", "Gods_Pos_Limit": "神祇位置上限",
+    # ---- 事件（`Sj_*`）—— Sj = 事件（证据：表族 `Save_Sj_Ju_Qing_Data`＝事件剧情）
+    "Sj_Code": "事件编号", "Sj_Type": "事件类型", "Sj_Name": "事件名称",
+    "Sj_Unlock_Time": "解锁时间", "Sj_King_Code": "事件国编号",
+    "Sj_Map_Code": "事件城池编号", "Sj_Str": "事件文本", "Sj_Num": "事件数量",
+    "Sj_Obj_King": "事件对象国", "Sj_Obj_Array": "事件对象表",
+    "Sj_Action_Obj": "事件行为对象",
+    # ---- 军队 / 别部 / 官府
+    "Jun_Dui_Bie_Bu_Official_System": "军队别部官制", "Bie_Bu_List": "别部表",
+    "InPut_Miao": "所属庙", "Unit_Jun_Dui_Start_Map_Service": "军队起始城池服务",
+    # ---- 城池 / 地图 / 资源点
+    "Presence_Time": "驻留时间", "People_Count": "人口", "City_ID": "城池编号",
+    "Ge_Ren_Map": "个人城池", "Land_Data": "土地数据",
+    "Noble_Land_Data": "贵族土地数据", "Cur_Hp": "当前体力",
+    "Zhi_Li_Fang_Zheng": "治理方针",
+    # ---- 国家 / 家族
+    "Sum_Evaluate_Data_Array": "总评数据表", "Last_Year_King_Value_Data": "去年国值数据",
+    "Wen_Hua_Chuan_Tong": "文化传统", "First_Evaluate": "首评",
+    "Jia_Zu_Sheng_Wang": "家族声望", "Zhan_Lue_Type": "战略类型",
+    "Finish_Type": "结局类型", "Finish_Ci_Shu": "结局次数",
+    "Cur_Zhan_Lue": "当前战略",
+    # ---- 商业 / 库房（`Li_Run` = 利润，证据：同表 `Li_Run_Note`）
+    "Fund_Num": "资金数量", "Order_Li_Run": "订货利润",
+    "Ling_Shou_Li_Run": "零售利润", "Fen_Hong_Value": "分红值",
+    "Yu_Qian": "余钱", "Acquisition_People_Cost": "收购人员成本",
+    "Taxation_Cost": "税负成本", "Buy_Value": "买入值", "Sell_Value": "卖出值",
+    "Ke_Fang_Data": "客房数据", "Shareholder_Type": "股东类型",
+    # ---- 奇遇 / 师徒 / 建筑
+    "Adventure_Code": "奇遇编号", "Adventure_State": "奇遇状态",
+    "Teacher_Code": "教师编号", "Student_Code_Array": "学生编号表",
+    "Creator_Ren_Code": "创建者编号",
+    "Build_Type_Name_Code": "建筑类型编号", "Build_Code": "建筑编号",
+    "Build_Name": "建筑名称", "Build_Level": "建筑等级",
+    "Build_Owner_Type": "建筑所有者类型",
+    # ---- 宗庙牌位的附加字段（宗庙页「全祭祀」里出现）
+    "MemorialAdditionalWorld": "附加世界",
+    # ---- 商业 / 库房（生意系统：Share=股份 · Chi_Gu=持股 · Li_Run=利润）
+    "Share_Arr": "股份表", "Share_Num": "股份数量", "Share_Data_Arr": "股份数据表",
+    "Chi_Gu_Num": "持股数量", "Store_Li_Run_Lv": "库房利润率",
+    "Reserve_Fund": "储备资金", "Fund_Liu_Cun_Lv": "资金留存率",
+    "Li_Run_Note": "利润备注", "Sell_Goods_Info": "售货信息",
+    "Buy_Goods_Info": "进货信息",
+    "Zu_Xun_Stone_Warehouse": "祖训石库房",
+    # ---- 国家
+    "King_Is_Ji_Tian": "是否祭天", "Jue_Wei": "爵位",
+    # 客馆「游士」名单（值是人物编号，由 xref 逆向转录成人名）
+    "Ren_Map": "游士", "You_Shi_Data": "游士数据",
+    "Tong_Meng_King_Array": "同盟国表", "Dead_Ren_Num": "已故人数",
+    "Gong_Qing_Gong_Lao_Map": "公卿功劳簿", "Yin_Qin_Wei_Xi_Array": "姻亲世系表",
+    "Wei_Xi_Array": "世系表", "Huo_De_Map": "获得城池",
+    "Diu_Shi_Map": "丢失城池", "Nian_Zhang_Map": "年长城池",
+    "You_Nv_Data": "幼女数据",
+    # ---- 商业 / 生产（`Chan_Tou`=产投 · `Li_Gong`=力工 · `Gu_Gong`=雇工）
+    "Share_System": "股份系统", "Share_Sys_Data": "股份系统数据",
+    "Mao_Yi_City_Code_Set": "贸易城池编号集", "Trade_Share_Note": "贸易份额备注",
+    "Acquisition_People_Info": "收购人员信息", "Produce_Line_Arr": "生产线表",
+    "Produce_Res_Arr": "产出资源表", "Span_Res_Arr": "跨度资源表",
+    "Span_Res_Point_Arr": "跨度资源点表", "Max_Kai_Cai_Nan_Du": "最大开采难度",
+    "Chan_Tou_Bi": "产投比", "Gu_Gong_Num": "雇工数", "Wei_Hu_Value": "维护值",
+    "Ren_Kou_Zhuan_Hua_Li_Gong_Num": "人口转化力工数",
+    "Goods_Info_Arr": "货物信息表", "Goods_Code": "货物编号", "Goods_Num": "货物数量",
+    "Creat_Order_Time": "创建订单时间", "Order_ID": "订单编号",
+    "Bao_Qi_Array": "宝器表",
+    # ---- 收尾批（2026-10-03）
+    #   ⚠️ 存档里同一字段有**拼写变体**：`MemorialAdditionalWorld` 与
+    #      `Memorial_Additional_Wold`（原文把 World 拼成了 Wold）—— 两个都要登记。
+    "Memorial_Additional_Wold": "附加世界",
+    "Man_Code": "男子编号", "Woman_Array": "女性表", "Jue_Wei_Array": "爵位表",
+    "King_Is_Ji_Zu": "是否祭祖", "City_Index": "城池序号",
+    "Unique_Ren_Code": "唯一人物编号", "Jie_Ju_Code": "结局编号",
+    "Dan_Bao_Ren_Array": "担保人表", "Jie_Dai_Data": "借贷数据",
+    "Jian_Die_Data": "间谍数据", "Lin_Shi_Hua_Shen_Code_List": "临时化神编号表",
+    "Is_Dang_Ju_Shou_Ci_Chui_Lin": "是否受赐垂临",
+    "Tian_Ming_You_Gui_Time": "天命有归时间",
+    "Shui_Lu_Hai_Lu_Jun_Dui_Speed": "水路海路军队速度",
+    "Play_King_Xiao_Mie_Name_Set": "消灭国名单集",
+    # ---- AI（`Ai_*` 为游戏内 AI 行为记录）
+    "Ai_Content": "AI内容", "Ai_Must_Content": "AI必做内容",
+    "Player_Ai_Content": "玩家AI内容", "Ai_Every_Month_Content": "AI每月内容",
+    "Ai_Content_List": "AI内容表",
+    # ---- 以下三条语义证据较弱，按字面读，**未获游戏内验证**
+    "Is_Yan_Qing": "是否宴请", "Is_Kui_Lei": "是否馈赠",
+    "Is_Already_Fa_Qi": "是否已发起", "Is_Old_Fix": "是否旧定",
+    "Open_Rong_Di_Win": "开放戎狄胜利",
 
     # ---------------------------------------------------------- 家族关系 / 势力
     "Guan_Xi": "关系", "Tong_Xing": "同姓", "Yin_Qin": "姻亲",
@@ -652,6 +832,38 @@ INTERNAL_IDS = {
 }
 
 
+# ---- 编号字段（★ 2026-10-03 使用者裁定）
+#   「**凡事涉及到编号的，全部隐藏不要显示在面板上**，作为隐藏属性你自己能看懂就行了」
+#   「我不需要编号，你直接写**人名/城市**等等」
+#   判据只看**字段名**（`Ren_Code` / `Map_Code` / `Gods_Code` / `Code` / `ID` / `key`…）。
+#   引用型字段（字段名不是编号、但**值**是编号，如客馆的 `Ren_Map`）不在此列 ——
+#   那些由 `xref` **逆向转录成人名/城名**再显示（见 `person_view._fmt_val`）。
+ID_SUFFIXES = ("_Code", "_ID", "_Id", "_code", "_Ids", "_Code_Arr")
+ID_EXACT = {"Code", "code", "ID", "id", "Id", "key", "Key", "Index_List",
+            # ★ 2026-10-03 使用者裁定：「立绘和颜色没办法，**这两个在面板隐藏**」——
+            #   `Face_Str`（`QPfaxing-7`）是立绘素材名、`Color_Str`（`#1c2366`）是色值，
+            #   都是**内部素材标识**：译不了，也不该给人看。实测显示审计里「含 ASCII
+            #   的裸值」这两类占一大块。⚠️ 必须进 `ID_EXACT` —— `is_id_field()` 查的是
+            #   它（不是 `INTERNAL_IDS`），进错地方等于没改。
+            "Face_Str", "Color_Str",
+            # ★ 2026-10-04：国家色值（`#911042`）与 Color_Str 同类 —— 内部素材
+            #   标识，译不了也不该给人看（使用者：「不要有编码」）。
+            "King_Colore"}
+# 「编号映射表」也算内部索引（如 `King_Code_Text_Map` = 国编号 → 正文下标）
+ID_TOKEN = ("Code", "ID", "Id")
+
+
+def is_id_field(key) -> bool:
+    """这个字段是不是「编号」——面板上一律不显示（只当内部锚点用）。"""
+    s = str(key or "")
+    if not s or s.startswith("_"):
+        return False
+    if s in ID_EXACT or s.endswith(ID_SUFFIXES):
+        return True
+    return (s.endswith(("_Map", "_Set", "_List"))
+            and any(t in s for t in ID_TOKEN))
+
+
 def field_label(key: str) -> str:
     """字段 → 中文名。已登记的走字典；没登记的做词根兜底，绝不返回空。"""
     if key is None:
@@ -743,6 +955,43 @@ VALUE["Ren_Zu_Yu_上古"] = {
 #   证据链（三条独立证据互相印证）与免责声明见 `app/gods.py` 模块头。
 VALUE["Faith_Gods_Sys_Code"] = dict(GOD_SYS_BY_CODE)
 
+# ---- 神明码（`Gods_Arr` 里的神格 / 威能）★ 2026-10-03
+#   两者都是**逗号分隔的码**（`"sg0001,sg0004"` / `"wn0005,wn0008"`），
+#   所以同时登记进 `MULTI_VALUE_FIELDS` —— `code_of` 会**按码逐个译**再拼回来。
+#   码表的单一来源仍是 `app/gods.py`（存档 ↔ 攻略交叉反解，见那边模块头）。
+#   `Gods_Code`（sm00xx → 神名）由 `gods.attach_table()` 载入存档时登记（跨档相同）。
+VALUE["Godhood_Code_Arr"] = dict(GODHOOD)
+VALUE["Passive_Effect"] = dict(WEI_NENG)
+
+# 值是「逗号分隔的码串」的字段 —— 必须逐个译，整串直接查表永远查不到。
+MULTI_VALUE_FIELDS = {"Godhood_Code_Arr", "Passive_Effect"}
+
+# ---- 政策 / 能力（★ 2026-10-03）
+#   `Zheng_Ce_Code` 实测本档出现 **44994 次**，**全部**能在政策名表里查到。
+#   此前它被误登记进 `xref.RULES` 当「城名」解（只有 30.5% 碰巧命中），
+#   于是面板上把政策名显示成了**城名**。现在归位到本地化层：
+#   **有专属码表的字段，不再登记成引用**（不变式，见 `tools/check_labels.py`）。
+VALUE["Zheng_Ce_Code"] = dict(ZHENG_CE_CODES)
+# ★ **字段名别名**：存档里同一套码会换字段名。`Save_KingData.Zu_Yu` 就是族域码
+#   （实测值 0/6/7…），而码表原先只挂在 `Ren_Zu_Yu` 名下 ⇒ 国表的「族域」列一律
+#   显示成裸码「6」而不是「北狄」。这里让两个字段**共用同一张表**（仍是同一对象源）。
+#   ⚠️ 这类「同表异名」由 `tools/check_labels.py` 第 ⑨ 节全档自动侦测。
+VALUE["Zu_Yu"] = VALUE["Ren_Zu_Yu"]
+# 宗庙「祭祀人物爵位（新）」实测 1855 次取值**全部**落在 `King_Jue_Wei_Code` 里
+# ⇒ 同一套爵位枚举（由守卫第 ⑨ 节的别名侦测发现）。
+VALUE["Memorial_Ren_Jue_Wei_New"] = VALUE["King_Jue_Wei_Code"]
+
+# ---- 军队类型（★ 2026-10-03 显示审计揪出）----
+#   `Army_Controller/Army_Data_Array…Type` 的值是**游戏自己写的枚举名**：
+#   `Hu_Ben` / `Liang_Yi` / `San_Jun`（各 120 条，实测全量只有这三种）。
+#   它们正好补上 labels 里那三张「未证实」表缺的底（虎贲 / 两翼 / 三军）。
+#   ⚠️ 表按**字符串**取值 ⇒ 不会污染别处同为 `Type` 的**数字**字段。
+VALUE["Type"] = {"Hu_Ben": "虎贲", "Liang_Yi": "两翼", "San_Jun": "三军"}
+VALUE["Zheng_Ce_Data"] = dict(ZHENG_CE_CODES)
+VALUE["Neng_Li_Code"] = dict(NENG_LI_CODES)
+VALUE["Neng_Li_Data"] = dict(NENG_LI_CODES)
+MULTI_VALUE_FIELDS |= {"Zheng_Ce_Data", "Neng_Li_Data"}
+
 # ---- 外交关系数值：⚠ 2026-09-22 修正 —— 原映射 {0:中立 30:同盟 60:敌对} **是错的**。
 #      全档实测 16576 条，取值范围 **0 ~ 200、无负数**，是**好感度/信任度**这一连续量，
 #      与「中立/同盟/敌对」不是一回事 —— 证据：关系值 = 0 的记录里，
@@ -781,8 +1030,9 @@ VALUE["Map_State"] = {4: "正常"}
 #             存档实测跨档 31 人（含姜尚、子受＝商纣王、妘灵皇等）。
 #
 #      【女性段】100+，与男性段**并行**（不是更高）。
-#        ⚠️ 方向与男性段**相反**：码越大等级越高，但名字按「美 → 佳 → 淑 → 丽 → 良」自低向高。
-#        使用者确认：100=美 101=佳 102=淑 103=丽 104=良
+#        码越大等级越高（与男性段同向）：智略自低向高 = 良 → 丽 → 淑 → 佳 → 美。
+#        ⚠️ 2026-10-09 使用者订正：曾误记为「100=美 … 104=良」，**正好相反** ——
+#           100=良 101=丽 102=淑 103=佳 104=美（下面智略均值随码单调递增，正相印证）。
 #        ⚠️ 使用者要求：显示时**不加「女」字前缀**（男女段的分野由「性别」列自己说明）。
 #        上古档实测（智略均值单调递增，印证方向）：
 #            100 →46.1（n=297）  101 →67.9（n=394）  102 →81.6（n=65）
@@ -796,16 +1046,16 @@ VALUE["Ren_Leve"] = {
     5: "将", 6: "臣", 7: "君", 8: "豪",
     10: "圣",
     11: "神",
-    # 女性五级（码越大越高：美最低 → 良最高）
+    # 女性五级（码越大越高：良最低 → 美最高；★ 2026-10-09 订正，原映射反了）
     # ⚠️ 2026-09-21 使用者二次裁改：105 原译「后妃」→ 单字「哲」（与男段的「君/豪」同样单字）。
     # ⚠️ 2026-09-22 使用者三次裁改：106 原译「宠姬」→ 单字「国」
     #   （对照戚姬=106 游戏内徽标显示「国」，即宠妃级）。
-    100: "美", 101: "佳", 102: "淑", 103: "丽", 104: "良",
+    100: "良", 101: "丽", 102: "淑", 103: "佳", 104: "美",
     105: "哲", 106: "国",
 }
 
 # ---- 人物等级的**顺序标签**（给 GUI 排序/着色用，不参与显示文本）
-#      男性段 0-4 由低到高 = 庶 下 中 上 邦；女性段 100-104 由低到高 = 美 佳 淑 丽 良
+#      男性段 0-4 由低到高 = 庶 下 中 上 邦；女性段 100-104 由低到高 = 良 丽 淑 佳 美
 LEVE_ORDER = {
     0: 0, 1: 1, 2: 2, 3: 3, 4: 4,
     5: 5, 6: 6, 7: 7, 8: 8,
@@ -1178,6 +1428,13 @@ def code_of(field: str, value):
     table = VALUE.get(field)
     if table is None:
         return None
+    # ★ 2026-10-03：逗号码串字段（神格 / 威能）要**逐个译**再拼回来 ——
+    #   整串直接查表永远查不到（`"sg0001,sg0004"` 不是一个键）。
+    #   有任何一个码译不出，就整条返回 None（原样显示，宁缺勿猜）。
+    if field in MULTI_VALUE_FIELDS and isinstance(value, str) and "," in value:
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        zh = [table.get(p) for p in parts]
+        return "、".join(zh) if all(zh) else None
     try:
         return table.get(value)
     except TypeError:
@@ -1205,6 +1462,11 @@ def decode(field: str, value):
         return Decoded("—", "空值")
     if value == "":
         return Decoded("", "空字符串")
+
+    # ★ 2026-10-03：布尔值原样显示成 `True` / `False`（实测世界页有 10 个布尔字段、
+    #   出现 5800+ 次）—— 是彻头彻尾的英文。**布尔就是是否**，直接译是 / 否。
+    if isinstance(value, bool):
+        return Decoded("是" if value else "否", "布尔")
 
     # 时间三元组
     if field in TIME_FIELDS or (isinstance(value, str) and "," in value

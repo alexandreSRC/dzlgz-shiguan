@@ -71,6 +71,37 @@ def est_text_px(text, pt):
     return (full + half * 0.55) * pt * 1.08 * _dpi.SCALE
 
 
+def wrap_text_px(text, px, pt):
+    """把长文本按**像素**手工断行（返回带 `\\n` 的文本）。
+
+    ⚠️ 为什么不能用 Tk 的 `wraplength`（★ 2026-10-03 实测）：
+      Tk 只在**空格**处断行 —— 中文整串没有空格、长英文单词也没有，
+      于是一整行直接冲出控件被裁掉。实测同一个串在 `wraplength=450` 下：
+        纯中文长串 → 标签请求宽 **453 px**（没断）
+        纯拉丁无空格 → **454 px**（没断）
+        拉丁带空格   → 446 px（断了）
+      ⇒ 值里有中文/长标识符时**必须自己插换行**。
+
+    宽度用 `est_text_px` 按字累加（纯 Python，比逐字 `tkfont.measure` 快两个量级），
+    且它**故意估大 8%** ⇒ 断出来的行只会偏短，不会溢出。
+    """
+    if not text or px <= 0:
+        return str(text)
+    unit = pt * 1.08 * _dpi.SCALE
+    out = []
+    for para in str(text).split("\n"):
+        cur, w = "", 0.0
+        for ch in para:
+            cw = unit * (1.0 if ord(ch) > 0x2E80 else 0.55)
+            if cur and w + cw > px:
+                out.append(cur)
+                cur, w = "", 0.0
+            cur += ch
+            w += cw
+        out.append(cur)
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------- 统一高度基线
 
 _LINESPACE_CACHE = {}
@@ -869,3 +900,63 @@ class ChipRow(tk.Frame):
                 font=(self.theme.font_ui_fallback, self._size,
                       "bold" if on else "normal"),
             )
+
+
+# ---------------------------------------------------------------- 爵位颜色注
+# ★ 2026-10-04 使用者：参考效果图「爵位颜色注：■神 ■帝 ■王 ■公 ■侯 ■伯 ■子 ■卿」，
+#   在**两个画布**（代际家谱 / 时间家谱）的**右上角固定**显示一份。
+#
+# ⚠️ 为什么用 `place` 放**控件**，而不是画布图元：
+#   画布图元会随 `yview/xview`（滚动、拖动平移）一起走，得在每次重绘时重算坐标，
+#   还会被「只留视口 ± 半屏」的淘汰逻辑连坐删掉；而 `place` 的子控件**不参与画布
+#   坐标系**，天然钉在右上角、拖动不变。`relx=1.0 + anchor="ne"` 让它随窗口宽度自适应。
+def tier_legend(parent, theme, in_=None, extra=None):
+    """生成并**摆好**「爵位颜色」小条，返回该 Frame（调用方留着做主题重建用）。
+
+    `extra`：图例最前面的额外项，默认神（取 `theme.tier["神"]`，缺则回退
+    `theme.divine`）—— 效果图第一格就是它。
+    顺序照效果图：神 → 帝 → 王 → 公 → 侯 → 伯 → 子 → 卿（「无」不列，那是灰默认）。
+
+    ★ 2026-10-05 三改（使用者）：
+      ① 文案「爵位颜色注」→「爵位颜色」；
+      ② 神帝王的色格**加大（14×14）+ 黑框**，与后五档拉开 —— 与卡面光晕
+        （TOP_TIERS，见 theme.lighten）同一口径；
+      ③ 新增 `in_`：**摆位基准窗**。图例必须挂在画布的**容器**上、只是
+        `place(in_=画布)` 对齐 —— 挂在画布上会被 PrintWindow 连人拍进
+        拖动快照，拖动时图例鬼影跟着滑到画布中间（使用者实测）。
+    """
+    from ..theme import TIER_TOP
+    fr = tk.Frame(parent, bg=theme.bg_panel, highlightthickness=1,
+                  highlightbackground=theme.border, bd=0)
+    tk.Label(fr, text="爵位颜色：", bg=theme.bg_panel, fg=theme.text_3,
+             font=(theme.font_ui_fallback, theme.fs_body_sm)).pack(
+        side=tk.LEFT, padx=(7, 3), pady=2)
+    if extra is None:
+        extra = (("神", theme.tier.get("神") or theme.divine),)
+    items = []
+    for name, col in extra:
+        items.append((name, col or theme.divine))
+    for k in ("帝", "王", "公", "侯", "伯", "子", "卿"):
+        if k in theme.tier:
+            items.append((k, theme.tier[k]))
+    for name, col in items:
+        top = name in TIER_TOP
+        sw = tk.Frame(fr, bg=col, width=14 if top else 11,
+                      height=14 if top else 11,
+                      highlightthickness=1,
+                      highlightbackground=theme.text if top else theme.border,
+                      bd=0)
+        sw.pack(side=tk.LEFT, padx=(4, 2), pady=4 if top else 5)
+        sw.pack_propagate(False)
+        tk.Label(fr, text=name, bg=theme.bg_panel, fg=theme.text,
+                 font=(theme.font_ui_fallback, theme.fs_body_sm)).pack(
+            side=tk.LEFT, padx=(0, 2))
+    # ★ 2026-10-04 使用者：「要放在最右上角，意思是**贴着画布的右沿和上沿**」
+    #   ⇒ 偏移归零（原来是 x=-12 / y=10 的内缩）。
+    # ★ 2026-10-05：`in_` 摆位基准 = 画布；父窗口 = 画布的容器（见 docstring ③）。
+    if in_ is not None:
+        fr.place(in_=in_, relx=1.0, x=0, y=0, anchor="ne")
+        fr.lift()
+    else:
+        fr.place(relx=1.0, x=0, y=0, anchor="ne")
+    return fr

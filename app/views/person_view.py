@@ -30,11 +30,21 @@ from .. import storage
 from .. import xref as XR
 from ..widgets import msgbox as messagebox
 from ..widgets.kit import (Card, ChipRow, FlatButton, chip as kit_chip,
-                           est_text_px, hsep, input_box, text_label, tip)
+                           est_text_px, hsep, input_box, text_label, tip,
+                           wrap_text_px)
 
 APP_TITLE = "大周列国志 · 存档阅览器"
 
 MAX_ROWS = 20000          # ★ 2026-09-25：《全史存档》13,526 人要能整表列出
+
+# 表格单元格里最多显示多少字（超出部分**悬停出全文**，不是直接丢掉）。
+# ★ 2026-10-06 使用者报「史书记事文本被隐藏了那么长，不是说不准盖住字吗」——
+#   原来这里是硬编码的 `70`，语义不明（读代码的人以为是「最多 70 字」），
+#   改成一个有名字、有注释、且**与悬停配套**的常量。
+# 为什么仍要截断：`_fit_world_cols` 的列宽上限是 300px，长文本全展开会把列撑成
+#   一条长带、整张表横向拉不完 —— 违反「表格思维：单元格大小定死」。
+#   按项目既有口径（世界页字段说明、「＋N」），**前段上屏 + 全文走悬停**。
+_CELL_MAX = 70
 
 
 def split_hint(text):
@@ -79,6 +89,109 @@ MUTE_FIELDS = PF.HIDDEN_FIELDS
 #   （`world_view` / `table_view` 一直在用）。
 #   三者签名一致（widget, text, delay）⇒ **直接别名，调用点一处不用改**。
 Tooltip = tip
+
+
+class _DynTip:
+    """**文本可变**的悬停框 —— 「先创建、后改文本」用法唯一正确的载体。
+
+    ★ 2026-10-06 复核发现（本批修）：`kit.tip()` 有两个语义，靠它做动态文本**必死**：
+      ① 空文本**直接 `return widget`**，一个事件都不绑；
+      ② `_show()` 用的是**创建时捕获的闭包 `text`**，事后改 `.text` 属性
+         只是给 Tk 控件挂了个普通 Python 属性，**无任何 UI 效果**。
+      项目里因此埋了三处死模式（功能一直没生效）：
+      `_title_tip`（表标题悬停）· `_nav_tip`（世界页导航悬停）·
+      `_cell_tip`（本批新加的单元格全文悬停）。
+    本类与 `_bind_header_tip` 的手写 Toplevel **同一套模式**（项目内已验证），
+    两种用法二选一：
+      · `follow_mouse=True`（表格/树）：调用方在 `<Motion>` 里 `poke(text, x_root, y_root)`
+        —— 窗口未开则延迟 380ms 弹出（防掠过闪烁），已开则**立即**更新文本与位置；
+      · `follow_mouse=False`（固定控件，如标题 Label）：`set_text()` 更新文本，
+        `<Enter>` 弹出在控件**下方**（与 kit.tip 同位）。
+    样式照抄 kit.tip（#3a3a3a / 微软雅黑 10 / wraplength 340px），视觉不分岔。
+    """
+
+    def __init__(self, host, follow_mouse=True):
+        self.host = host
+        self.win = None
+        self._lbl = None
+        self._after = None
+        self._text = ""
+        self._pos = None
+        host.bind("<Leave>", lambda e: self.hide(), add="+")
+        host.bind("<ButtonPress>", lambda e: self.hide(), add="+")
+        if not follow_mouse:
+            host.bind("<Enter>", lambda e: self._sched(), add="+")
+
+    def set_text(self, text):
+        """更新待显文本（follow_mouse=False 的用法）。空 = 悬停不弹。"""
+        self._text = str(text or "")
+        if not self._text:
+            self.hide()
+
+    def poke(self, text, ex, ey, delay=380):
+        """鼠标移动驱动（follow_mouse=True 的用法）。
+
+        窗口已开 ⇒ **立即**改文本与位置（悬停看全要求跟手）；未开 ⇒ 延迟弹出。
+        """
+        self.set_text(text)
+        if not self._text:
+            self.hide()
+            return
+        self._pos = (ex + 14, ey + 16)
+        if self.win is not None and self._lbl is not None:
+            self._lbl.configure(text=self._text)
+            self.win.wm_geometry(f"+{self._pos[0]}+{self._pos[1]}")
+            return
+        self._sched(delay)
+
+    def _sched(self, delay=380):
+        self._cancel()
+        if not self._text:
+            return
+        self._after = self.host.after(delay, self._open)
+
+    def _open(self):
+        if self.win is None:
+            self.win = tk.Toplevel(self.host)
+            self.win.wm_overrideredirect(True)
+            try:
+                self.win.attributes("-topmost", True)
+            except Exception:
+                pass
+            frm = tk.Frame(self.win, bg="#3a3a3a", bd=1, relief=tk.SOLID)
+            frm.pack()
+            self._lbl = tk.Label(frm, text=self._text, bg="#3a3a3a",
+                                 fg="#f5f5f5", justify=tk.LEFT,
+                                 wraplength=_dpi.px(340),
+                                 font=("微软雅黑", 10), padx=8, pady=5)
+            self._lbl.pack()
+        if self._pos is None:            # 非跟随模式：固定在控件下方（kit.tip 同位）
+            try:
+                self._pos = (self.host.winfo_rootx() + 14,
+                             self.host.winfo_rooty() + self.host.winfo_height() + 4)
+            except Exception:
+                self._pos = (100, 100)
+        if self._lbl is not None:
+            self._lbl.configure(text=self._text)
+        self.win.wm_geometry(f"+{self._pos[0]}+{self._pos[1]}")
+
+    def hide(self):
+        self._cancel()
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+            self.win = None
+            self._lbl = None
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.host.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
 
 
 # 生卒年时间排序的解析（年.月，如 -192.12 / 57.08）
@@ -332,8 +445,9 @@ class PersonView:
                                     bg=th.bg_app, fg=th.text)
         self.table_title.pack(fill=tk.X, padx=10, pady=(8, 4))
         # 标题里的「（……）」解释走悬停（使用者 2026-09-21 要求）；
-        # 文本每次导航时更新，所以 Tooltip 只建一次、之后改 `.text` 即可。
-        self._title_tip = Tooltip(self.table_title, "")
+        # 文本每次导航时更新 —— ⚠️ kit.tip 做不了动态文本（空文本直接返回控件、
+        # 闭包吃死 text），2026-09-21 起这里就没生效过；2026-10-06 换 `_DynTip`。
+        self._title_tip = _DynTip(self.table_title, follow_mouse=False)
 
         wrap = tk.Frame(mid, bg=th.bg_app)
         wrap.pack(fill=tk.BOTH, expand=True, padx=(8, 4), pady=(0, 6))
@@ -350,6 +464,15 @@ class PersonView:
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
         self.table.bind("<<TreeviewSelect>>", lambda e: self._on_row())
+        # ★ 2026-10-06 使用者报「史书记事文本被隐藏了那么长」——
+        #   根因：`_cell` 里原有 7 处硬编码 `[:70]`，列宽上限又只有 300px ⇒
+        #   表格里**不可能**展示长文本。两处一起改：
+        #   ① 表格只放**前 `_CELL_MAX` 字**（够认是哪一条，不遮字）；
+        #   ② **悬停出全文**（`_DynTip`，kit.tip 做不了动态文本 —— 见类注释）。
+        #   为什么要留前段而不是全展开：全展开会把 300px 上限的列撑成一条长带，
+        #   整张表横向拉不完 —— 违反「表格思维：单元格大小定死」。
+        self._cell_tip = _DynTip(self.table, follow_mouse=True)
+        self._bind_cell_tip()
         # ★ 2026-09-23「仅显所选」：人物页表格行也能右键「选定」（用名字匹配谱牒）
         self.table.bind("<Button-3>", self._on_row_right)
         # ★ 2026-09-24 双击一行 → 跳到「家谱」页代际模式，落到他的铭牌上
@@ -442,6 +565,49 @@ class PersonView:
             self.dv.itemconfigure(self._detail_win, width=e.width)
             # 卡片宽度变了 ⇒ 标题行边界与「定位到表格」槽宽跟着重新对齐
             self._sync_title_row()
+            # ★ 2026-10-04 卡片宽度变化 ⇒ 子表列宽跟着重排（防右缘裁字）
+            self._fit_sub_tables()
+            # ★ 2026-10-06 卡片**高度**变化 ⇒ 子表该显几行也跟着重算
+            #   （否则窗口拉高后记录表还是那么矮，下半屏继续空着）。
+            #   高度变化通常不伴随宽度变化，所以上面那次重排列宽不覆盖它。
+            self._retune_sub_heights()
+
+        def _retune_sub_heights():
+            """按当前卡片高度重设每张子表的显示行数（只调 `height`，不重建）。"""
+            want = self._sub_rows_by_height()
+            if want == self.SUB_ROWS:
+                return
+            for tv, natural, wrap, has_sb, tail, shown in list(
+                    getattr(self, "_sub_fits", [])):
+                try:
+                    if not wrap.winfo_exists():
+                        continue
+                except Exception:
+                    continue
+                # 无滚动条 = 已全部显示（不需要改）；有滚动条才按 want 加高。
+                # ★ 2026-10-06 复核修：必须**夹住实际条目数** ——
+                #   `tv.configure(height=want)` 是「显示 want 行高」，数据只有
+                #   12 行而 want=30 时会显示 12 行数据 + 18 行**空白**
+                #   （撑空，恰是使用者批过的「下半屏空着」的镜像）。
+                #   `len(tv.get_children())` 就是数据条数，Treeview 能直接给。
+                if not has_sb:
+                    continue
+                try:
+                    n = len(tv.get_children())
+                    if n > self.SUB_ROWS:
+                        tv.configure(height=max(self.SUB_ROWS, min(want, n)))
+                except Exception:
+                    pass
+
+        # ★ 2026-10-06 空详情卡提示（使用者裁定「试试，保留回滚的选择」）：
+        #   未选中行时右侧详情栏整块空白（840px）—— 一行居中提示补上空态语义。
+        #   回滚 = config.json 里 "empty_detail_hint": false（或删掉本块）。
+        if self.app.cfg.get("empty_detail_hint", True):
+            self.detail_hint = tk.Label(
+                right, bg=th.bg_panel, fg=th.text_3, justify="center",
+                font=(th.font_ui_fallback, th.fs_body),
+                text="在左侧表格点选一行\n这里显示该行的全字段详情")
+            self.detail_hint.place(relx=0.5, rely=0.42, anchor="center")
         self.dv.bind("<Configure>", _on_dv_configure)
         self.detail_inner.bind(
             "<Configure>", lambda e: self.dv.configure(scrollregion=self.dv.bbox("all")))
@@ -1035,7 +1201,7 @@ class PersonView:
             lbl, hint = split_hint(t.label or C.label_of_family(name))
             tail = "" if name in (t.label or "") else f"　·　表名 {name}"
             self.table_title.configure(text=f"{lbl}　·　{len(t)} 条{tail}")
-            self._title_tip.text = hint
+            self._title_tip.set_text(hint)
             self._apply_filter()
 
     def goto_family(self, name, select_code=None):
@@ -1071,9 +1237,52 @@ class PersonView:
                     spec = v
                     break
         if spec is None:
-            flat = [f for f in t.fields if f not in HEAVY_FIELDS and f not in MUTE_FIELDS]
+            flat = [f for f in t.fields if f not in HEAVY_FIELDS
+                    and f not in MUTE_FIELDS
+                    and not (L.is_id_field(f) and not XR.RULES.get(f))]
             spec = [(f, 110, False) for f in flat[:C.FALLBACK_COLS]]
-        return [(key, w, right) for key, w, right in spec if key in t.fields]
+        # ★ 2026-10-03 使用者裁定：「凡事涉及到编号的，全部隐藏不要显示在面板上」
+        #   但同一段话里也要求「**你直接写人名/城市**」「包括城市的编号等等」⇒
+        #   规则是 **能逆向解出名字的编号就显示名字，解不出才隐藏**：
+        #   `Map_Code`→城名（xref 有规则，保留）、`Ren_Code` 之类解不出的才滤掉。
+        # ★ 2026-10-04 世界页去编码（使用者：「不要有编码」），在上一条之上再加两刀：
+        #   ① **表的自身编号列直接不画** —— 表里有自己的名字列（King_Name /
+        #      Map_Name / Name / Ren_Name / Genealogy_Name / Jia_Shi）时，行已经
+        #      有名有姓，再摆一列裸编号纯属噪音（国家·总表打头那列 0/4/100017
+        #      就是它）；
+        #   ② **解不出名字的引用编号列也不画** —— 抽样 40 行，能逆解出实体名的
+        #      不足三成的（如某表 King_Code 里全是本档查无此国的人名码），列出来
+        #      只会是一列「—」，不如不占地方。
+        has_name = any(f in t.fields for f in
+                       ("Ren_Name", "King_Name", "Map_Name", "Name",
+                        "Genealogy_Name", "Jia_Shi"))
+        sample = t.rows[:40]
+        out = []
+        for key, w, right in spec:
+            if key not in t.fields:
+                continue
+            if L.is_id_field(key) and not XR.RULES.get(key):
+                continue
+            if has_name and key in XR.SELF_FIELDS:
+                continue
+            if has_name and L.is_id_field(key) and sample:
+                # ★ `Map_Code` 这类已从 SELF_FIELDS 移出的字段，在**自己的表里**
+                #   仍是自身编号 —— 判据：抽样值几乎唯一（每行一个号）⇒ 是行的
+                #   身份证；在别的表里它反复出现（城被引用多次）⇒ 是引用，保留。
+                vals = [str(r.get(key)) for r in sample
+                        if r.get(key) not in (None, "", [], {})]
+                if len(vals) >= 10 and len(set(vals)) >= len(vals) * 0.9:
+                    continue
+            if L.is_id_field(key) and sample and getattr(self, "xref", None):
+                vals = [r.get(key) for r in sample]
+                vals = [v for v in vals if v not in (None, "", [], {})]
+                if vals:
+                    hit = sum(1 for v in vals
+                              if self.xref.resolve(key, v, allow_self=True))
+                    if hit * 10 < len(vals) * 3:      # 解出率 < 30%
+                        continue
+            out.append((key, w, right))
+        return out
 
     def _person_columns(self):
         """人物页的列（键 / 宽 / 是否右对齐）。
@@ -1202,6 +1411,76 @@ class PersonView:
         self._pcol_sig, self._pcol_w = sig, widths
         return widths
 
+    def _fit_world_cols(self, cols):
+        """世界表列宽按**实际内容**适配（★ 2026-10-04 使用者：「表格思维……
+        注意汉字之间不要互相遮挡」）。
+
+        手写的列宽（catalog.COLUMNS 里那些 66/76/110）是按某一本档估的，
+        换档就裁字——国家·总表的「国世系」（`皋陶|` 这种串）在 110px 里
+        断成一截一截。这里照 `_fit_person_cols` 同一套量法：表头 + 抽样
+        单元格的**实测像素**取最大，夹在 [40, 300]，按 (表族, 行数, 列序)
+        缓存。单元格文本用 `_cell` 量 —— 编号解名之后列宽跟着变短，正好。
+        """
+        sig = (self.cur_family, len(self.all_pairs),
+               tuple(k for k, _w, _r in cols))
+        if getattr(self, "_wcol_sig", None) == sig and getattr(self, "_wcol_w", None):
+            return self._wcol_w
+        rows = [p[0] for p in (self.all_pairs or [])[:MAX_ROWS]]
+        step = max(1, len(rows) // 600)
+        sample = rows[::step][:600]
+        pt = self.theme.fs_body
+        hpt = self.theme.fs_body_sm
+        widths = {}
+        for key, _w, _right in cols:
+            head = key[3:] if key.startswith("_p:") else self._head_label(key)
+            need = est_text_px(head, hpt) + 14
+            for r in sample:
+                try:
+                    v = self._cell(r.get(key, ""), key, self.xref)
+                except Exception:
+                    continue
+                if v and v != "（空）":
+                    need = max(need, est_text_px(v.split("\n")[0], pt) + 14)
+            widths[key] = math.ceil(max(40, min(need, 300)))
+        self._wcol_sig, self._wcol_w = sig, widths
+        return widths
+
+    def _sync_world_col_widths(self, event=None):
+        """世界表列宽**按可用宽度同步**（★ 2026-10-04 使用者：「汉字之间不要互相遮挡」）。
+
+        `_fit_world_cols` 量出的理想宽合计常宽过表格可视区（国世系一列就要
+        271px）—— `stretch=True` 时 ttk 会把各列**等比压瘪**，表头互相叠字
+        （实测「兵力劳役天正国建国」挤成一团）。这里改成：`stretch=False`
+        定死列宽，再按 **avail / ideal** 的比例整体缩放——
+          · 视口窄 ⇒ 各列等比收窄，谁也不叠谁（长值在格内裁尾，不越界）；
+          · 视口宽 ⇒ 等比放宽，右侧不留白（2026-09-26「中间空白一大片」同守）。
+        由表格的 `<Configure>` 触发，宽度没变 8px 以上就不动（防抖）。
+        """
+        tv = self.table
+        fam = self.cur_family
+        if fam is None or fam in self.PERSON_VIEW_FAMILIES \
+                or fam in self.PERSON_RAW_TABLES:
+            return
+        fitted = getattr(self, "_wcol_w", None)
+        if not fitted:
+            return
+        avail = tv.winfo_width()
+        if avail < 120:
+            return
+        prev = getattr(self, "_wcol_avail", 0)
+        if abs(prev - avail) < 8 and getattr(self, "_wcol_synced_fam", None) == fam:
+            return
+        total = sum(fitted.values())
+        k = avail / max(1, total)
+        for key, w in fitted.items():
+            try:
+                tv.column(key, width=max(36, min(int(w * k), 360)),
+                          stretch=False)
+            except Exception:
+                pass
+        self._wcol_avail = avail
+        self._wcol_synced_fam = fam
+
     def _hidden_cols(self):
         """本谱牒声明要**隐藏的列**（`source.hide_cols`）。
 
@@ -1287,12 +1566,21 @@ class PersonView:
         tv.delete(*tv.get_children())
         if self.slot is None or self.cur_family is None:
             return
+        # ★ 2026-10-06：每次重画前清空「悬停看全」的缓存（否则换表后残留旧文本）。
+        self._cell_full = {}
         cols = self._columns()
-        self._cols = cols
         hidden_cols = self._hidden_cols()      # 本谱声明隐藏的列（年龄/余寿）
+        # ★ 2026-10-04 世界表列宽按内容适配（防裁字）；人物表走 _person_columns
+        #   自己的量法（姓名定宽 5 字那套），不在这里动。
+        person_view = (self.cur_family in self.PERSON_VIEW_FAMILIES
+                       or self.cur_family in self.PERSON_RAW_TABLES)
+        if not person_view:
+            wf = self._fit_world_cols(cols)
+            cols = [(k, wf.get(k, w), r) for k, w, r in cols]
+        self._cols = cols
         tv["columns"] = [c[0] for c in cols]
         for key, w, right in cols:
-            head = key[3:] if key.startswith("_p:") else C.label_of(key)
+            head = key[3:] if key.startswith("_p:") else self._head_label(key)
             tv.heading(key, text=head, anchor="e" if right else "w",
                        command=lambda k=key: self._sort_by(k))
             # ★ 2026-09-25 列宽一律固定（`stretch=False`）—— 使用者裁定「够用就行」：
@@ -1300,11 +1588,25 @@ class PersonView:
             #   窗口越大越宽，看着就像「姓名栏越来越宽」）。
             # ★ 2026-09-26 改回 stretch：固定宽在宽屏下右侧空白一大片
             #   （使用者报「中间空白一大片」）—— 各列均摊剩余宽度，不再留白。
-            tv.column(key, width=w, anchor="e" if right else "w", stretch=True)
+            # ★ 2026-10-04 世界表改走 `_sync_world_col_widths`（按可视区整体
+            #   等比缩放，既不叠字也不留白；见该方法注释）；人物表维持 stretch。
+            if not person_view:
+                tv.column(key, width=w, anchor="e" if right else "w",
+                          stretch=False)
+            else:
+                tv.column(key, width=w, anchor="e" if right else "w",
+                          stretch=True)
         self._bind_header_tip(tv, cols)
+        if not person_view:
+            # 视口尺寸就绪/变化时重排列宽（首绘时 winfo_width 还没就绪）
+            tv.update_idletasks()
+            self._sync_world_col_widths()
+            if not getattr(self, "_wcol_conf_bound", False):
+                self.table.bind("<Configure>", self._sync_world_col_widths,
+                                add="+")
+                self._wcol_conf_bound = True
 
-        person_view = (self.cur_family in self.PERSON_VIEW_FAMILIES
-                       or self.cur_family in self.PERSON_RAW_TABLES)
+        # （person_view 判定已提到上面列宽适配处）
         # ★ 2026-09-23 使用者要求：人物页默认按「智略」从高到低排。
         #   点表头排序照旧 —— `sort_key` 非空时用使用者的选择，空时才是默认。
         sort_key, sort_desc = self.sort_key, self.sort_desc
@@ -1368,7 +1670,24 @@ class PersonView:
                 if code and not PF.is_historical(code):
                     tags.append("nohist")
             else:
-                vals = [self._cell(r.get(key, ""), key) for key, _w, _r in cols]
+                # ★ 2026-10-06：非人物表族（世界页）。除了给表格用的短值，
+                #   再把**未截断的全文**存进 `_cell_full`，供单元格悬停取用
+                #   （`_cell` 里统一按 `_CELL_MAX` 截断，表格放不下长文本）。
+                #   ⚠️ 循环变量**不能叫 `shown`** —— 外层已有一个 `shown`
+                #     （行列表 `pairs[:MAX_ROWS]`），遮蔽它会让下面
+                #     `self.rows = [p[0] for p in shown]` 遍历字符串
+                #     ⇒ `IndexError: string index out of range`（我踩过）。
+                vals = []
+                for key, _w, _r in cols:
+                    raw = r.get(key, "")
+                    cell_txt = self._cell(raw, key, self.xref)
+                    vals.append(cell_txt)
+                    if isinstance(raw, (str, list, dict)) and len(str(raw)) > _CELL_MAX:
+                        # 译文可能比原文长（编号→名字），两种都留着
+                        full = self._fmt_val(key, raw) if not isinstance(raw, str) \
+                            else str(PersonView._decode_ctx(key, raw).text)
+                        if full and len(full) > len(cell_txt):
+                            self._cell_full[(str(i), key)] = full
             # 已故行不再叠斑马纹（与谱牒层表格同款：整行统一灰底）；
             # 有余寿底色的行也不用斑马纹（那层色就是它的区分）
             if ys is not None:
@@ -1432,8 +1751,48 @@ class PersonView:
         tv.bind("<Motion>", motion, add="+")
         tv.bind("<Leave>", lambda e: tip_off(), add="+")
 
+    def _bind_cell_tip(self):
+        """表格单元格悬停 ⇒ 出该格的**完整**内容（长文本的唯一出口）。
+
+        ★ 2026-10-06：解决使用者报「史书记事被隐藏了那么长」。
+          表格里放不下全文（列宽上限 300px），所以**表格给前段、全文给悬停** ——
+          这正是项目既有口径「多出的收成 ＋N / 全量走悬停」的同一套做法。
+        ★ 2026-10-06 复核修（初版三个 bug 叠加，悬停**从未生效过**）：
+          ① `Tooltip(self.table, "")` 空文本时 kit.tip 直接返回控件本身 ⇒
+             `.text = ...` 是给 Tk 控件挂普通 Python 属性，无任何效果 ——
+             已换 `_DynTip`（真·动态文本悬停框）；
+          ② 条件写反了：`e.y > 26`（数据区）反而**清除**——悬停只在表头区有效；
+             现在**数据区才弹**（`e.y <= 26` 是表头，交给 `_bind_header_tip`）；
+          ③ `tv.column(cid)` 不带 option 返回的是**选项 dict**，不是列名 ⇒
+             `(rid, col)` 永远查不到 `_cell_full`。改用 `self._cols[idx][0]` 取列名
+             （与 `_bind_header_tip` 同款）。
+        """
+        def motion(e):
+            if e.y <= 26:                 # 表头区：交给表头悬停，不在这弹
+                self._cell_tip.hide()
+                return
+            tv = self.table
+            rid = tv.identify_row(e.y)
+            cid = tv.identify_column(e.x)
+            if not rid or not cid.startswith("#"):
+                self._cell_tip.hide()
+                return
+            try:
+                idx = int(cid[1:]) - 1
+            except ValueError:
+                self._cell_tip.hide()
+                return
+            cols = getattr(self, "_cols", None) or []
+            if not (0 <= idx < len(cols)):
+                self._cell_tip.hide()
+                return
+            full = getattr(self, "_cell_full", {}).get((rid, cols[idx][0]))
+            # 只有「—」这种占位就不必弹；全文才有悬停价值
+            self._cell_tip.poke(full or "", e.x_root, e.y_root)
+        self.table.bind("<Motion>", motion, add="+")
+
     @staticmethod
-    def _cell(v, field="") -> str:
+    def _cell(v, field="", xref=None) -> str:
         if v is None:
             return ""
         if isinstance(v, dict):
@@ -1442,20 +1801,62 @@ class PersonView:
             if len(v) == 1:
                 only = next(iter(v.values()))
                 if not isinstance(only, (dict, list)):
-                    return str(only)[:70]
+                    return str(only)[:_CELL_MAX]
             if all(not isinstance(x, (dict, list)) for x in v.values()):
                 s = " · ".join(f"{L.field_label(k)}:{x if x != '' else '—'}"
                                for k, x in v.items())
             else:
                 s = f"（{len(v)} 项）"
-            return s[:70]
+            return s[:_CELL_MAX]
         if isinstance(v, list):
             if not v:
                 return "（空）"
             if all(not isinstance(x, (dict, list)) for x in v):
-                return ("、".join(str(x) for x in v))[:70]
+                # ★ 2026-10-03：这里原来直接 `str(x)`，绕过了 `decode` 的**富文本剥离**
+                #   ⇒ 「史书」两族的大事记在表格里满屏 `<color=#DA2020>` 乱码。
+                # ★ 2026-10-04：数组先走 `resolve_many` 逆向转录（国地图视角的
+                #   `King_Map_Array`=[城码…]、谥语的 `King_Code_Array`、世门的
+                #   `Student_Code_Array` 都是编号数组）—— 全解出就**只显名字**，
+                #   解不齐再退回逐项 decode（与详情卡 `_fmt_val` 同一口径）。
+                if xref is not None:
+                    named = xref.resolve_many(field, v)
+                    if named and len(named) == len(v[:30]):
+                        return ("、".join(nm for _c, nm in named))[:_CELL_MAX]
+                return ("、".join(PersonView._decode_ctx(field, x).text
+                                 for x in v))[:_CELL_MAX]
             return f"（{len(v)} 项）"
-        return str(PersonView._decode_ctx(field, v).text)[:70]
+        # ★ 2026-10-03：编号列（如客馆的「城」）在表格里也要**写名字不写编号**
+        #   —— `_cell` 是静态方法（`tools/smoke.py` 也直接调它），故 xref 走参数传入，
+        #   不传就退回原样（老调用点行为不变）。
+        # ★ 2026-10-04 世界页去编码（使用者：「编码全部本地化成汉字」）：
+        #   ① `allow_self=True` —— `King_Code` / `Code` / `Ren_Code` 这些「自身
+        #      编号」字段名在**别的表里出现时是引用**（资源分配表的 King_Code=0
+        #      → 秦），单元格里一样要解出名来；
+        #   ② 解不出的编号值一律画「—」，**绝不出裸数字** —— 与其让人对着一串
+        #      对不上的号码，不如明明白白告诉人「这里没有对应的名字」。
+        if xref is not None:
+            hit = xref.resolve(field, v, allow_self=True)
+            if hit:
+                return str(hit[1])[:_CELL_MAX]
+        # ★ 2026-10-04：逗号拼接（或单个）编号串（国家地图视角的 `King_Map_Array`
+        #   = "113,115,128,…"，不是真数组）—— 登记在 `ARRAY_RULES` 的字段按
+        #   逗号拆开逐个译，全解出就**只显名字**（实测 590/590 可解）。
+        if xref is not None and isinstance(v, str) \
+                and field in XR.ARRAY_RULES and re.fullmatch(r"\d[\d,\s]*", v.strip() or " "):
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            if parts:
+                kind = XR.ARRAY_RULES[field]
+                names = [xref.lookup(kind, p) for p in parts]
+                if all(names):
+                    return ("、".join(names))[:_CELL_MAX]
+        text = str(PersonView._decode_ctx(field, v).text)
+        # 兜底「—」的口径：编号字段 + **登记了译名规则但这条没解出**的字段
+        # （家族关系图的 Jia_Zu_Code_2 不是 *_Code 结尾，也算）——
+        # 两者都绝不让裸数字上屏。
+        if (L.is_id_field(field) or field in XR.RULES) \
+                and re.fullmatch(r"-?\d+(\.0)?", text or ""):
+            return "—"
+        return text
 
     @staticmethod
     def _decode_ctx(field, v):
@@ -1495,6 +1896,16 @@ class PersonView:
                 p = self.people.get(code)
                 if p is not None and p.daishu is not None:
                     return (0, float(p.daishu), "")
+            # ★ 2026-10-09 使用者报「女性的等级排序不对」：等级列原来落到
+            #   汉字 Unicode 排序（佳<丽<美<淑<良），男女两段全是乱的。
+            #   改按**段位**排（`labels.LEVE_ORDER`：男 庶0→邦4 / 将臣君豪 / 圣9 神10；
+            #   女 良0→美4，哲5 国6），取不到码的垫底 —— 与显示用同一份码表。
+            if zh == "等级":
+                try:
+                    _o = L.LEVE_ORDER.get(int(row.get("Ren_Leve")))
+                except (TypeError, ValueError):
+                    _o = None
+                return (0, float(_o), "") if _o is not None else (1, 0.0, "")
             v = self._cell_for(key, row, code)
             # ★ 2026-09-26 使用者报：生卒年排序把「-192.12」当普通数字比 ——
             #   负号把月份方向翻转，公元前同一年里 12 月反而排在 1 月后面。
@@ -1619,6 +2030,9 @@ class PersonView:
         #   ② 这里**拿到 None 就不动卡片**（没有选中 ≠ 该清空 —— 清空是"查无此人"的语义）。
         _i = self._selected_index()
         if _i is not None:
+            hint = getattr(self, "detail_hint", None)
+            if hint is not None and hint.winfo_ismapped():
+                hint.place_forget()           # 选中即收提示，让位给详情卡
             self._show_detail(_i)
 
     def _on_row_right(self, event):
@@ -1661,6 +2075,7 @@ class PersonView:
     def _show_detail(self, idx):
         for w in self.detail_inner.winfo_children():
             w.destroy()
+        self._sub_fits = []               # 子表列宽适配清单（见 _fit_sub_tables）
         self._in_lineage = False
         if idx is None or idx >= len(self.rows):
             self.detail_src.configure(text="")
@@ -1702,11 +2117,28 @@ class PersonView:
 
         if code not in (None, "") and self.rel is not None:
             self._rel_button(code)
+        # ★ 2026-10-03 修（使用者目检报「宗庙编号 → 宗庙编」）：
+        #   标签原来写死 `width=4`，而 **Tk 的 `width` 是「字符宽」= 数字 0 的宽**
+        #   （汉字约 2 倍宽）⇒ 4 字标签实际只放得下 ~3 个汉字，第 4 个字被裁。
+        #   改成：按**本卡最长标签的实测像素宽**给标签列 `minsize`，
+        #   标签自身不定宽 —— 全卡标签仍共用一条左沿（铁律①），一个字都不裁（铁律②）。
+        _keys = [k for k in row if k not in ("_来源",) and k not in MUTE_FIELDS
+                 and not (L.is_id_field(k) and not XR.RULES.get(k))]
+        self._label_px = int(max(
+            [est_text_px(self._head_label(k), self.theme.fs_body_sm) for k in _keys]
+            or [48])) + _dpi.px(8)
         for key, val in row.items():
-            if key in ("_来源",) or key in MUTE_FIELDS:
+            # ★ 2026-10-03 使用者裁定：编号字段不显示**编号本身**；
+            #   但能逆向解出名字的（如 `Map_Code`→城名）要显示**名字**，故保留。
+            # ★ 2026-10-04：`SELF_FIELDS`（自身编号）即使有规则也不再单列一行 ——
+            #   详情卡标题已经是这条记录自己的名字，再来一行「国 秦」纯属复读。
+            if (key in ("_来源",) or key in MUTE_FIELDS
+                    or key in XR.SELF_FIELDS
+                    or (L.is_id_field(key) and not XR.RULES.get(key))):
                 continue
             self._field_line(key, val)
         self.detail_inner.update_idletasks()
+        self._fit_sub_tables()            # 子表列宽按方框实测宽缩放（防右缘裁字）
         self.dv.yview_moveto(0)
         self._paint_act_bar()
 
@@ -1826,9 +2258,12 @@ class PersonView:
         rL = rR = R          # 两栏各自的行游标（都从当前行起步）
 
         def _cap(host, text, col, row):
-            """段落小标题（一律 4 字）—— 与字段标签同一条左沿（标签都定宽 4 字）。"""
+            """段落小标题（一律 4 字）—— 与字段标签同一条左沿（标签都定宽 4 字）。
+
+            ★ 2026-10-06 排版优化：小标题**加粗**（ui_rules「字号统一，层级
+            只靠加粗」—— 标题层与字段层靠字重分层，不动字号）。"""
             tk.Label(host, text=text, bg=t.bg_panel, fg=t.text_3, anchor="w",
-                     font=self.font(t.font_ui_fallback, t.fs_body_sm)
+                     font=self.font(t.font_ui_fallback, t.fs_body_sm, True)
                      ).grid(row=row, column=col, columnspan=3, sticky="w",
                             padx=(6, 0), pady=(6, 2))
 
@@ -2016,14 +2451,23 @@ class PersonView:
         #   「配偶 无 / 姐妹 无」同口径（铁律：不写解释，空就是「无」）。
         _vs = str(val).strip() or "无"
         _num = _vs != "无" and all(ch in "0123456789./,:+-−×° " for ch in _vs)
+        # ★ 2026-10-06 使用者：「年龄/寿命/智略等需要注意的内容要加粗」——
+        #   关键数值字段（年龄/余寿/智略/等级）的**值**加粗；纯数字走
+        #   Arial Bold（数字规则不变），含中文走中文字体加粗。
+        _key = zh_label in ("年龄", "余寿", "智略", "等级") and _vs != "无"
         # ⚠️ 这里**不能**用 `width=`：Tk 的 Label `width` 是**固定字符宽 + 超出裁掉**，
         #   与 `wraplength`（折行）同时给时 **width 优先**，长值（"彭绥英 · 男/等级 上/史"）
         #   会被裁成"男/等纟"（实测）。所以只给 wraplength，宽度交给列。
-        vl = tk.Label(line, text=_vs, bg=t.bg_panel, fg=t.text, anchor="w",
+        # ★ 2026-10-03：同 `_field_line` —— Tk 的 `wraplength` 断不了中文（见 `_wrap_long`）。
+        #   人物卡的值列宽由 6 列网格定死，`wrap` 传进来的就是**真实可用宽**，
+        #   所以这里按它手工断行即可，不需要 `<Configure>` 重排。
+        _budget = wrap or _dpi.px(200)
+        vl = tk.Label(line, text=wrap_text_px(_vs, _budget, t.fs_body_sm),
+                      bg=t.bg_panel, fg=t.text, anchor="w",
                       justify=tk.LEFT,
-                      wraplength=wrap or _dpi.px(200),
+                      wraplength=_budget,
                       font=self.font("Arial" if _num else t.font_note,
-                                     t.fs_body_sm))
+                                     t.fs_body_sm, bold=_key))
         if row is None:
             lb.pack(side=tk.LEFT, anchor="nw")
             vl.pack(side=tk.LEFT, padx=(2, 0))
@@ -2092,6 +2536,34 @@ class PersonView:
     #   （含 main / tools / 右键菜单）**零调用**。
     #   日后想恢复这个视图，从右键菜单接一个入口即可（`profiles.Lineage` 保留）。
 
+    def _wrap_long(self, lb, raw, pt):
+        """长值专用：按标签**实到的宽**手工插换行 —— Tk 的 `wraplength` 断不了中文。
+
+        ★ 2026-10-03（使用者报「宗庙这页右边字被挡住很多」）：Tk 的 `wraplength`
+          只在**空格**处断行，中文整串与长标识符都没空格 ⇒ 整行冲出控件被裁
+          （实测纯中文长串在 `wraplength=450` 下仍请求 453 px）。
+        做法：绑 `<Configure>`，宽度一变就重排；只在结果真的不同时才
+          `configure(text=…)`，免得与 Tk 自身的重排互相触发抖动。
+        ⚠️ 调用方必须让标签 `sticky="ew"`（填满列）。否则标签的"实到宽"= 它自己的
+          请求宽，等于拿结果当输入，重排会收敛到错的值。
+        """
+        st = {"w": -1, "raw": str(raw)}
+
+        def _apply(px):
+            if px <= 8:
+                return
+            txt = wrap_text_px(st["raw"], px, pt)
+            if txt != lb.cget("text"):
+                lb.configure(text=txt)
+
+        def _on_cfg(e):
+            if abs(e.width - st["w"]) > 3:
+                st["w"] = e.width
+                _apply(e.width)
+
+        lb.bind("<Configure>", _on_cfg, add="+")
+        return _on_cfg
+
     def _field_line(self, key, val):
         # ★ 2026-09-28 全项目整理（第 3 批，铁律①「尽量汉字左对齐」）：
         #   本方法（**非人物**分支）原来标签**右对齐**（`anchor="e"` +
@@ -2102,17 +2574,306 @@ class PersonView:
         t = self.theme
         line = tk.Frame(self.detail_inner, bg=t.bg_panel)
         line.pack(fill=tk.X, padx=6, pady=1)
-        line.columnconfigure(0, weight=0)
+        # 标签列：按卡片里最长标签的**实测像素**定宽（见 `_show_detail` 的说明）
+        line.columnconfigure(0, weight=0, minsize=getattr(self, "_label_px", 0))
         line.columnconfigure(1, weight=1)
         derived = str(key).startswith("_")
-        tk.Label(line, text=C.label_of(key), bg=t.bg_panel, width=4,
+        tk.Label(line, text=self._head_label(key), bg=t.bg_panel,
                  fg=t.accent if derived else t.text_3, anchor="w",
+                 justify=tk.LEFT,
                  font=self.font(t.font_ui_fallback, t.fs_body_sm)
                  ).grid(row=0, column=0, sticky="nw")
-        tk.Label(line, text=self._fmt_val(key, val), bg=t.bg_panel,
-                 fg=t.text if not derived else t.accent, anchor="w", justify=tk.LEFT,
-                 wraplength=_dpi.px(300), font=self.font(t.font_note, t.fs_body_sm)
-                 ).grid(row=0, column=1, sticky="w", padx=(2, 0))
+        # ★ 2026-10-03（使用者：「乱糟糟的一大片，不是说用表格思维吗？」）：
+        #   **列表套字典 = 一张真表**（如「全祭祀」= 73 行 × 21 列）。原来把它
+        #   压成一行 `k=v；k=v；…` 再折行 —— 那是**一坨文字**，违背「单元格定死」。
+        #   现在按表画：表头 + 每项一行，整行跨两列（该合并就合并）；
+        #   列超 5 收成「＋N」、行超 8 收成「…共 N 行」，全量走悬停
+        #   （沿用项目既有口径「多出的收成 ＋N + 悬停看全」）。
+        if self._is_subtable(val):
+            self._sub_table(line, 0, 1, val)
+            return
+        if isinstance(val, dict) and val:
+            self._kv_grid(line, val)
+            return
+        vl = tk.Label(line, text=self._fmt_val(key, val), bg=t.bg_panel,
+                      fg=t.text if not derived else t.accent, anchor="w",
+                      justify=tk.LEFT, wraplength=_dpi.px(300),
+                      font=self.font(t.font_note, t.fs_body_sm))
+        vl.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+        self._wrap_long(vl, self._fmt_val(key, val), t.fs_body_sm)
+
+    # ---- 详情卡里的「内嵌表」：列表套字典按表格排版 -------------------------
+    SUB_COLS, SUB_ROWS = 5, 8
+
+    def _sub_rows_by_height(self, vis_hint=0):
+        """详情卡里一张子表能显示几行 —— **量**详情卡的可用高度，不写死。
+
+        ★ 2026-10-06：起因是使用者报「记录表只占这么小空间，下半屏空着」。
+          做法守「**量不要算**」：量 `self.dv`（详情卡滚动区）的高度，
+          减去已用高度与一行的高度，得能再放几行。
+          为什么要留**余量**：其它字段行（标签 + 值）还要占地方，
+          子表吃满整卡会把后面的字段挤出可视区（那才是真的「看不见」）。
+        """
+        try:
+            box = self.dv.winfo_height()
+        except Exception:
+            return self.SUB_ROWS
+        if box < _dpi.px(120):            # 还没布局/太矮 ⇒ 老实按 8 行
+            return self.SUB_ROWS
+        # 一行大约 20px（含行距），留 40px 余量给下方的字段行
+        per = _dpi.px(20)
+        room = int((box - _dpi.px(40)) / per)
+        # 最多 40 行：再多滚动条意义不大，且 40 行 × 20px 已占满多数卡片
+        return max(self.SUB_ROWS, min(room, 40))
+
+    @staticmethod
+    def _is_subtable(v):
+        """值是不是「一张表」——列表且每项都是字典（键可不齐）。"""
+        return (isinstance(v, list) and bool(v)
+                and all(isinstance(x, dict) for x in v))
+
+    def _kv_grid(self, line, d, at_row=0, at_col=1):
+        """字典 → **两列对齐表**（字段 | 值）；值里再套表就递归套一张表。
+
+        ★ 2026-10-03：原来字典走 `_fmt_val` 拼成 `字段：值\\n…` 的一坨文字，
+          而值里若再嵌数组（如「当今国评价」里的 `Sum_Evaluate_Data_Array`）
+          就被压回 `k=v；k=v` 的行内串 —— 正是使用者说的「乱糟糟的一大片」。
+          现在统一按表排：每个字段一行、两列对齐，嵌套数组直接套子表。
+        """
+        t = self.theme
+        host = tk.Frame(line, bg=t.bg_panel)
+        host.grid(row=at_row, column=at_col, sticky="ew", padx=(2, 0))
+        host.columnconfigure(0, weight=0)
+        host.columnconfigure(1, weight=1)
+        f_h = self.font(t.font_ui_fallback, t.fs_body_sm)
+        f_v = self.font(t.font_note, t.fs_body_sm)
+        r = 0
+        for k, v in d.items():
+            if L.is_id_field(k):        # 编号字段一律不显示（同详情卡/表格/子表）
+                continue
+            lb = tk.Label(host, text=L.field_label(k), bg=t.bg_panel, fg=t.text_3,
+                          anchor="w", justify=tk.LEFT, font=f_h)
+            lb.grid(row=r, column=0, sticky="nw", padx=(0, _dpi.px(10)))
+            Tooltip(lb, str(k))
+            if self._is_subtable(v):
+                self._sub_table(host, r, 1, v)
+            elif isinstance(v, dict) and v:
+                # ★ 2026-10-03：嵌套字典也按表排（原来回落到 `_fmt_val` 的一坨文字）
+                self._kv_grid(host, v, r, 1)
+            else:
+                s = self._fmt_val(k, v)
+                vl = tk.Label(host, text=s, bg=t.bg_panel, fg=t.text, anchor="w",
+                              justify=tk.LEFT, wraplength=_dpi.px(300), font=f_v)
+                vl.grid(row=r, column=1, sticky="ew", pady=1)
+                self._wrap_long(vl, s, t.fs_body_sm)
+            r += 1
+
+    @staticmethod
+    def _head_label(key):
+        """列 / 字段标题。
+
+        ★ 2026-10-03 使用者：「我不需要编号，你直接写人名/城市等等」——
+          编号字段若 `xref` 有规则（值能逆向解成名字），标题就改用**实体类别**
+          （国 / 城 / 人 / 家族），配上值里的名字正好是「国 将」「城 咸阳」；
+          编号本身一个字都不出现。
+        ★ 2026-10-04：外交表的甲方/乙方两列都解成国名，光给「国」分不出谁是谁
+          ⇒ 个别列按语义点名（值同样是国名，只是列名要说清立场）。
+        """
+        override = {"Wai_Jiao_Code_1": "甲方国", "Wai_Jiao_Code_2": "乙方国",
+                    "Jia_Zu_Code_1": "甲方家族", "Jia_Zu_Code_2": "乙方家族",
+                    "Teacher_Code": "教师", "Student_Code_Array": "学生"}
+        if key in override:
+            return override[key]
+        if L.is_id_field(key) or key in XR.ARRAY_RULES:
+            kind = XR.RULES.get(key) or XR.ARRAY_RULES.get(key)
+            if kind:
+                return XR.KIND_ZH.get(kind, C.label_of(key))
+        return C.label_of(key)
+
+    @staticmethod
+    def _name_order(key):
+        """子表列序：姓(0) → 氏(1) → 名(2) → 全名(3) → 其余(4)。
+
+        ★ 2026-10-03 使用者：「用表格思维排序的时候记得，**姓 氏 名 按照这个顺序排**，
+          哪有名在姓前的？」—— 于是子表不再照存档原序，按这个语义序排。
+        """
+        s = str(key)
+        if s in ("Zu_Xing", "Ren_Shi") or s.endswith("_Xing"):
+            return 0
+        if s == "Jia_Shi" or (s.endswith("_Shi") and "Ming" not in s):
+            return 1
+        if "Ming" in s:
+            return 2
+        if s.endswith("_Name") and not s.endswith("_Cache"):
+            return 3
+        return 4
+
+    @staticmethod
+    def _short_label(key):
+        """子表表头 —— **一个字**：姓 / 氏 / 名 / 庙 / 父 / 级 / 主。
+
+        ★ 2026-10-03 使用者：「**只写 姓 氏 名 庙 作为 label 抬头就行**」——
+          子表列多、卡窄，长标题（族姓 / 家氏 / 祭祀人名 / 祭祀名）把表头挤成
+          一片（实测「正统」+「国姓」会糊成「正统国姓」）；一个字既够辨认，
+          又把宽度让给数据。判据按**字段语义**，不写死表名。
+        """
+        s = str(key)
+        if s.endswith("_Xing") or s in ("Zu_Xing", "Ren_Xing"):
+            return "姓"
+        if s == "Jia_Shi" or (s.endswith("_Shi") and "Ming" not in s):
+            return "氏"
+        if s.startswith("Miao_") or "Zong_Miao" in s:
+            # 庙名 / 庙等级 / 庙主题 / 庙开放类型
+            if s.endswith("_Name"):
+                return "庙"
+            if s.endswith("_Level"):
+                return "级"
+            if s.endswith("_Theme"):
+                return "主"
+            return "庙"
+        if "Father" in s or s.startswith("Fu_"):
+            return "父"
+        if "Mother" in s or s.startswith("Mu_"):
+            return "母"
+        # ★ 2026-10-04 使用者（宗庙·祭祀牌位截图）：「姓 氏 名 后面那个应该是
+        #   庙号 简称庙即可 不要写名」—— `Memorial_Name`（受祭称号「秦帝子纠」）
+        #   是**庙号**一列，不是名；照 Miao_Name 同例给「庙」。
+        if s == "Memorial_Name":
+            return "庙"
+        if "Ming" in s or s.endswith("_Name"):
+            return "名"
+        return C.label_of(key)
+
+    @staticmethod
+    def _cell_px(s, fs):
+        """按**中文字宽 ≈ 字号**估列宽（汉字等宽，ASCII 减半）——够用且稳。"""
+        w = 0
+        for ch in str(s or ""):
+            w += 1.0 if ord(ch) > 0x2E80 else 0.55
+        return int(w * fs) + _dpi.px(10)
+
+    def _sub_table(self, line, at_row, at_col, items):
+        """把 `[{…}, {…}]` 画成**方框表格**：真表头 + 可滚动看全。
+
+        ★ 2026-10-03 使用者三条裁定（原话）：
+          ①「只写 姓 氏 名 庙 作为 label 抬头就行」⇒ 表头一个字（`_short_label`）；
+          ②「既然可以上下拉动，为什么家庙和下面太庙**不做成两个方框表格里面可以
+             滑动看到所有数据**，而不是你省略了很多的那个共多少行」⇒
+             行**不再截断**：方框内自带纵向滚动条，`…共 N 行` 那句删掉；
+          ③ 尾巴不再是光秃秃的「＋10」（看不懂），改「**另 N 列**」+ 悬停列字段名。
+        """
+        t = self.theme
+        cols = [k for k in items[0].keys() if not L.is_id_field(k)]
+        cols.sort(key=self._name_order)
+        shown = cols[:self.SUB_COLS]
+        rest_c = cols[self.SUB_COLS:]
+        fs = t.fs_body_sm
+
+        # 单元格文本先算好（列宽要按**最长内容**定）
+        # ★ 2026-10-04：取文本改走 `_cell`（原来自 struck `_decode_ctx`）——
+        #   `_decode_ctx` 只认 VALUE 译码表，`Miao_Theme`（庙主题=人物编号）这类
+        #   **xref 引用**在子表里就漏成裸数字 4003；`_cell` 译名 + 兜底「—」
+        #   与大表同一口径（使用者：「编码全部本地化成汉字」）。
+        cells = []
+        for item in items:
+            row = []
+            for k in shown:
+                v = item.get(k)
+                row.append("—" if v in (None, "")
+                           else str(self._cell(v, k, self.xref)))
+            cells.append(row)
+
+        brd = getattr(t, "border", None) or getattr(t, "border_2", None)
+        wrap = tk.Frame(line, bg=t.bg_panel, highlightthickness=1,
+                        highlightbackground=brd, highlightcolor=brd, bd=0)
+        wrap.grid(row=at_row, column=at_col, sticky="ew", padx=(2, 0), pady=(1, 3))
+        wrap.columnconfigure(0, weight=1)
+
+        # ★ 2026-10-06 使用者报「族谱人物记录表只占这么小空间，下半个版面就这么空着，
+        #   怎么就不知道用这个记录表填满呢」——
+        #   原来框高**写死** `min(len(items), SUB_ROWS)`＝最多 8 行，与卡片实际
+        #   高度无关 ⇒ 记录表只有 8 行高，下半屏白白空着。
+        #   改成：**按详情卡当下的可用高度算能显示几行**（行高按实测，
+        #   下限 8 行避免卡片太矮时反而更挤），卡片变高就多显几行，把空间用上。
+        #   仍然 `min(…, len(items))` ⇒ 数据不满时**不撑空**（不造空白行）。
+        vis = min(len(items), max(self.SUB_ROWS, self._sub_rows_by_height(vis_hint=len(items))))
+        tv = ttk.Treeview(wrap, columns=[f"c{i}" for i in range(len(shown))],
+                          show="headings", height=vis, selectmode="none")
+        natural = []
+        for c, k in enumerate(shown):
+            tv.heading(f"c{c}", text=self._short_label(k),
+                       command=lambda kk=k: None)
+            # 列宽 = max(表头, 该列最长单元格)；收着点，长了让 Treeview 自己截断
+            w = max(self._cell_px(self._short_label(k), fs),
+                    max((self._cell_px(r[c], fs) for r in cells), default=0))
+            w = min(w, _dpi.px(150))
+            natural.append(w)
+            tv.column(f"c{c}", width=w, anchor="w", stretch=False)
+        for r in cells:
+            tv.insert("", "end", values=r)
+        tv.grid(row=0, column=0, sticky="ew")
+        has_sb = len(items) > vis
+        if has_sb:
+            sb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+            tv.configure(yscrollcommand=sb.set)
+            sb.grid(row=0, column=1, sticky="ns")
+        # 悬停表头看**原始字段名** —— 这就是「中文 ↔ 原字段」的对等关系
+        self._bind_sub_heads(tv, shown, rest_c)
+        tail = None
+        if rest_c:
+            tail = tk.Label(wrap, text="另 %d 列：%s" % (
+                len(rest_c), "、".join(C.label_of(x) for x in rest_c)),
+                bg=t.bg_panel, fg=t.text_3, anchor="w", justify=tk.LEFT,
+                font=self.font(t.font_ui_fallback, t.fs_body_sm))
+            tail.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(4, 0))
+        # ★ 2026-10-04 使用者（宗庙截图）：「右边信息栏的都有汉字被挡住」——
+        #   五列各按最长内容定宽（单列上限 150px），合计常常**宽过卡片**，
+        #   最右的列连表头带数据一起被裁。登记进 `_sub_fits`，由
+        #   `_fit_sub_tables()` 按方框实测宽度**整体等比缩放**（视口窄就收、
+        #   宽就摊满），卡片尺寸变化时经 `_on_dv_configure` 重算。
+        self._sub_fits.append((tv, natural, wrap, has_sb, tail, shown))
+
+    def _fit_sub_tables(self):
+        """把详情卡里每张子表的列宽缩放到**方框实测宽度**（防右缘裁字）。"""
+        for entry in list(getattr(self, "_sub_fits", [])):
+            tv, natural, wrap, has_sb, tail, shown = entry
+            try:
+                if not wrap.winfo_exists():
+                    self._sub_fits.remove(entry)
+                    continue
+                box = wrap.winfo_width()
+                if box < 80:
+                    continue
+                sb_w = self.theme.scrollbar_w if has_sb else 0
+                avail = box - sb_w - _dpi.px(4)
+                total = sum(natural) or 1
+                k = max(0.2, avail / total)
+                for c, w in enumerate(natural):
+                    tv.column(f"c{c}", width=max(26, min(int(w * k), _dpi.px(340))),
+                              stretch=False)
+                if tail is not None:
+                    tail.configure(wraplength=max(120, box - _dpi.px(10)))
+            except Exception:
+                continue
+
+    def _bind_sub_heads(self, tv, shown, rest_c):
+        """子表表头悬停显示「中文（原字段）」全名。"""
+        def _on_motion(e):
+            reg = tv.identify_region(e.x, e.y)
+            if reg != "heading":
+                return
+            try:
+                ci = int(tv.identify_column(e.x)[1:]) - 1
+            except Exception:
+                return
+            if 0 <= ci < len(shown):
+                k = shown[ci]
+                tv.heading(ci, text="%s（%s）" % (self._short_label(k), k))
+        def _on_leave(e):
+            for c, k in enumerate(shown):
+                tv.heading(c, text=self._short_label(k))
+        tv.bind("<Motion>", _on_motion)
+        tv.bind("<Leave>", _on_leave)
 
     def _rel_button(self, code):
         t = self.theme
@@ -2135,12 +2896,26 @@ class PersonView:
             if not v:
                 return "（空）"
             if all(not isinstance(x, (dict, list)) for x in v):
-                shown = "、".join(str(x) for x in v[:24])
+                # ★ 2026-10-03 使用者两处裁定：
+                #   ①「要人名，要映射到人物上，你又不是没人物的总集数据」
+                #     ⇒ 数组里的**编号逆向转录成人名/城名**，**只显示名字**；
+                #   ②「编号 箭头 人物 这种模式我不要」⇒ 不再输出「编号 → 名」，
+                #     更不输出原编号。
+                named = (self.xref.resolve_many(key, v)
+                         if self.xref is not None else [])
+                # ⚠️ `resolve_many` 内部只取前 30 个 ⇒ 判「全解出」要按那 30 个比，
+                #   否则长名单（客馆 126 位游士）会掉回"先吐编号再补名字"的旧样子。
+                if named and len(named) == len(v[:30]):
+                    names = "、".join(nm for _c, nm in named)
+                    return names + (f"　…共 {len(v)} 项" if len(v) > 30 else "")
+                # 解不出的：按普通值走 decode（会剥离富文本，见「史书」那两族）
+                # ★ 长条目（整句话、如史书正文）改用换行分隔 —— 用「、」串句子读不通
+                _items = [self._decode_ctx(key, x).text for x in v[:24]]
+                sep = "\n" if any(len(s) > 16 for s in _items) else "、"
+                shown = sep.join(_items)
                 s = shown + (f"　…共 {len(v)} 项" if len(v) > 24 else "")
-                if self.xref is not None:
-                    named = self.xref.resolve_many(key, v)
-                    if named:
-                        s += "\n→ " + "、".join(f"{n}" for _c, n in named)
+                if named:
+                    s += "　｜　" + "、".join(nm for _c, nm in named)
                 return s
             out = []
             for x in v[:10]:
@@ -2159,7 +2934,8 @@ class PersonView:
         if self.xref is not None and key not in XR.SELF_FIELDS:
             hit = self.xref.resolve(key, v)
             if hit:
-                text += f"　→ {hit[1]}"
+                # ★ 2026-10-03：「编号 → 名」不要，**直接就是名字**
+                text = hit[1]
         return text
 
     # ---------------------------------------------------------------- 关系视图
@@ -2705,7 +3481,7 @@ class PersonView:
             "【字段值】只翻译有实证依据的，比如：\n"
             "　· 性别 0=男 1=女（用「纯女性表」反证过）\n"
             "　· 等级（男）0=庶 1=下 2=中 3=上 4=邦；5=将 6=臣 10=圣 11=神\n"
-            "　· 等级（女）100=美 101=佳 102=淑 103=丽 104=良（码大者高）\n"
+            "　· 等级（女）100=良 101=丽 102=淑 103=佳 104=美（码大者高）\n"
             "　· 爵位 3=王 5=侯 7=子（与上古档的国世系文本逐一对上）\n"
             "　证据不足的数字码会**原样显示**，不会编一个像样的错中文。\n\n"
             "【人物信息】\n"

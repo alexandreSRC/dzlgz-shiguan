@@ -159,6 +159,97 @@ def capture_widget(widget, prefer_printwindow=False, size=None):
         _user32.ReleaseDC(target, hdc)
 
 
+def capture_widget_region(widget, allow_screen=True):
+    """抓取 widget **自身**客户区（T2 拖动快照专用），返回 (宽, 高, BGRA)。
+
+    ★ 2026-10-05 修「拖动时画布左半出现幽灵菜单栏」：T2 快照此前误用
+      capture_widget —— 它按 GA_ROOT 抓的是**整个程序窗口**客户区，整窗
+      截图被原样贴进画布，左侧菜单栏/顶栏整块复制了进来。
+
+    取图顺序（与 capture_widget 相反，**PrintWindow 优先**）：
+    ① PrintWindow(widget 自身 HWND, PW_CLIENTONLY|PW_RENDERFULLCONTENT)
+       —— 实测 Tk 子控件**有**真 HWND 且 PrintWindow 渲染正确；
+    ② `allow_screen=True` 时屏幕 BitBlt 兜底（史馆在最上层时才准）；
+       **False 时禁用** —— 影子渲染台等场景，屏幕兜底会抓到盖在别处的
+       别家内容（主窗口/游戏），宁可报错重试。
+
+    ①若出全黑（★ 刚映射的窗口 DWM 表面未就绪，PrintWindow 会"成功"却
+    给黑图），稍候重试一次再判。
+    """
+    import time as _time
+    widget.update_idletasks()
+    # ★ update() 必须保留：实测 PrintWindow 抓的是**已落屏**内容，画布若还有
+    #   未画完的一帧（刚 create 完 / 刚滚动完），抓到的就是黑图。它清空事件
+    #   队列的副作用（拖动 Motion 重入 _on_drag）由调用方 _grab_busy 旗标挡住
+    #   —— 重入的 _grab_start 直接短路，嵌套的 xview_moveto 也无害（抓图像
+    #   素与锚点都取自 update 之后的同一视口状态）。
+    widget.update()
+    hwnd = widget.winfo_id()
+    rect = wintypes.RECT()
+    _user32.GetClientRect(hwnd, ctypes.byref(rect))
+    w, h = rect.right, rect.bottom
+    if w <= 0 or h <= 0:
+        raise RuntimeError(f"控件尺寸异常: {w}x{h}")
+
+    hdc = _user32.GetDC(hwnd)
+    memdc = _gdi32.CreateCompatibleDC(hdc)
+    bitmap = _gdi32.CreateCompatibleBitmap(hdc, w, h)
+    _gdi32.SelectObject(memdc, bitmap)
+    try:
+        bi = _BITMAPINFOHEADER()
+        bi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bi.biWidth = w
+        bi.biHeight = -h          # 负高度 = 自上而下
+        bi.biPlanes = 1
+        bi.biBitCount = 32
+        bi.biCompression = 0
+
+        def _read():
+            buf = ctypes.create_string_buffer(w * h * 4)
+            _gdi32.GetDIBits(memdc, bitmap, 0, h, buf, ctypes.byref(bi), 0)
+            return buf.raw
+
+        def _try_pw():
+            try:
+                return bool(_user32.PrintWindow(
+                    hwnd, memdc, PW_CLIENTONLY | PW_RENDERFULLCONTENT))
+            except Exception:
+                return False
+
+        data = b""
+        # ① PrintWindow 抓子控件自身（不受遮挡影响）；黑图稍候重试一次
+        if _try_pw():
+            data = _read()
+            if not _looks_black(data):
+                return w, h, data
+            _time.sleep(0.05)
+            widget.update_idletasks()
+            if _try_pw():
+                data = _read()
+                if not _looks_black(data):
+                    return w, h, data
+        if not allow_screen:
+            raise RuntimeError("PrintWindow 出图失败/全黑（已禁用屏幕兜底）")
+        # ② 屏幕 BitBlt 兜底
+        pt = wintypes.POINT(0, 0)
+        if _user32.ClientToScreen(hwnd, ctypes.byref(pt)):
+            screen = _user32.GetDC(0)
+            try:
+                ok = bool(_gdi32.BitBlt(memdc, 0, 0, w, h, screen,
+                                        pt.x, pt.y, SRCCOPY))
+            finally:
+                _user32.ReleaseDC(0, screen)
+            if ok:
+                data = _read()
+                if not _looks_black(data):
+                    return w, h, data
+        raise RuntimeError("画布区域抓图失败/全黑 —— 走降级路径")
+    finally:
+        _gdi32.DeleteObject(bitmap)
+        _gdi32.DeleteDC(memdc)
+        _user32.ReleaseDC(hwnd, hdc)
+
+
 def _chunk(tag, data):
     return (struct.pack(">I", len(data)) + tag + data +
             struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))

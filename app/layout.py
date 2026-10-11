@@ -58,6 +58,65 @@ class Layout:
     scroll_y_start: float = 0.0
     scroll_y_end: float = 0.0
     shift_count: int = 0
+    # ★ 2026-10-06 孤儿挂靠（与时间轴同规）：{孤儿: 锚}。连线绘制必须按它
+    #   跳过这些对 —— 挂靠只定位，不是血缘。
+    attach_side: Dict[str, str] = field(default_factory=dict)
+    attach_count: int = 0
+    # ★ 2026-10-06 入赘孩子（姓随母、布局挂母边）集合 —— 连线绘制用它决定
+    #   画母线（mlink）而不是父线；数据层 father 字段不动。
+    uz_kids: Set[str] = field(default_factory=set)
+
+
+def line_clan(children, root, memo=None):
+    """根这一支**实际用的姓/氏** ＝ 根 + 全部后裔的**姓名首字**里最常见的那个。
+
+    ★ 2026-10-11 使用者：「**同姓同氏的排一起 —— 徐氏隔得远**」。
+      徐国是**嬴姓徐氏**：根 `嬴章禹` 自己的名字用了「**姓**」（嬴），可它整条链
+      都叫「**徐**」（子＝徐融→徐简→徐侨→徐满…）—— 只看根自身首字会把它归到
+      「嬴」，与真正的徐氏根（`徐迈2` / `徐毅2`）分家，于是画布上一东一西。
+      故按**整支的主姓**归组（`children` = 父→子列表；后裔部分每支互不相交，
+      memo 兜住重复调用，整体 O(人)）。谱内没有别的「氏」字段可用时才走这里。
+    """
+    if memo is None:
+        memo = {}
+    v = memo.get(root)
+    if v is not None:
+        return v
+    cnt = {}
+    stack, seen = [root], set()
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        c = str(n)[:1]
+        cnt[c] = cnt.get(c, 0) + 1
+        stack.extend(children.get(n, ()))
+    v = max(cnt.items(), key=lambda kv: (kv[1], kv[0]))[0] if cnt else str(root)[:1]
+    memo[root] = v
+    return v
+
+
+def _ancestor_chains(people, names):
+    """names 里每个人的**祖先链**（沿「事实父 → 事实母 → 推定父」向上走到根）。
+
+    ★ 2026-10-04 使用者拍板（时间家谱孤立非史实节点）：「父链向上连通」——
+      选定/钉住者的祖先一并豁免滤镜，否则「仅显所选」只留选定者+男性后裔，
+      祖先被挡，选定的人在画布上悬空成孤点。链在『已收集过的人』处提前停
+      （多条链向上会汇合，不重复收集）；无上位者记录的散人无链可连。
+    """
+    out = set()
+    for start in names:
+        cur = start
+        seen = set()
+        while cur in people and cur not in seen:
+            seen.add(cur)
+            nxt = _parent(people[cur], people)
+            if not nxt or nxt in out:
+                break
+            out.add(nxt)
+            cur = nxt
+    return out
 
 
 def _parent(info, people):
@@ -79,6 +138,62 @@ def _parent(info, people):
         if p and p in people:
             return p
     return ""
+
+
+def _uzheng_family(people):
+    """识别「**入赘家庭**」（★ 2026-10-06 奇观场景：女君主 + 入赘）。
+
+    使用者立了允许女性当君主、允许入赘的奇观：一代女君主（如韩淑）娶了
+    十三个史实丈夫，孩子**姓随母**。若布局按父边走，孩子会被拆散到十几个
+    父系树里（实测：11 个韩姓孩子散在 9 棵树上，画面大乱）。
+
+    判据全用**硬数据**（不猜）：
+      · **母系家主** = 女性 + 无父无母（自立门户）+ 有孩子「姓随她、且 ≠
+        孩子的父姓」—— 姓取名字首字（本项目人名 = 姓 + 名，成立）；
+      · **入赘孩子** = 家主的这些孩子 ⇒ 布局**挂母边**；
+      · **入赘男**   = 男性 + 配偶里有母系家主 ⇒ 布局**挂妻**、离开自己的
+        父系（入赘 = 出宗，视觉上他是妻家的一员；血缘数据不动）。
+
+    返回 `(挂母的孩子集合, 家主集合, {入赘男: 家主妻})`。
+    """
+    kids_by_mother = {}
+    for n, r in people.items():
+        m = str(r.get("mother") or "")
+        if m:
+            kids_by_mother.setdefault(m, []).append(n)
+    matri = set()
+    for m, ks in kids_by_mother.items():
+        info = people.get(m) or {}
+        if str(info.get("gender") or "") != "女":
+            continue
+        if _parent(info, people):
+            continue                      # 有上位者 ⇒ 不是自立门户的家主
+        fam = str(m)[:1]
+        for k in ks:
+            kinfo = people.get(k) or {}
+            f = str(kinfo.get("father") or "")
+            if str(k)[:1] == fam and (not f or str(f)[:1] != fam):
+                matri.add(m)
+                break
+    if not matri:
+        return set(), set(), {}
+    uz_kids = set()
+    for m in matri:
+        fam = str(m)[:1]
+        for k in kids_by_mother.get(m, ()):
+            kinfo = people.get(k) or {}
+            f = str(kinfo.get("father") or "")
+            if str(k)[:1] == fam and (not f or str(f)[:1] != fam):
+                uz_kids.add(k)
+    chost = {}
+    # 入赘男判据：**从家主的 spouses 反推**（韩淑的 spouses 列了 13 夫，而男方
+    # 的 spouses 未必回指她 —— 实测 13 人只有 3 人的 spouses 里写了韩淑）。
+    for m in matri:
+        for h in (people.get(m) or {}).get("spouses") or []:
+            if h and h in people and h != m \
+                    and str((people.get(h) or {}).get("gender") or "") == "男":
+                chost[h] = m
+    return uz_kids, matri, chost
 
 
 def _dad_or_guess(info):
@@ -126,7 +241,8 @@ def _anchored_to_historical(info, people):
 def compute_layout(people, scale, hidden_non_historical=None,
                    cutoff_person=None, skip_collision=False,
                    base_font_size_name=15, hide_dead=False, focus_list=None,
-                   enrolled_list=None, pinned_list=None, hide_nohist_all=False):
+                   enrolled_list=None, pinned_list=None, hide_nohist_all=False,
+                   families=None, fam_ranks=None):
     """计算树形布局。people 为人物字典，其余参数与 v1 语义一致。
 
     `focus_list`（2026-09-23 新增）：「仅显所选」名单 —— 只保留名单上的人
@@ -235,6 +351,13 @@ def compute_layout(people, scale, hidden_non_historical=None,
     #   语义上「手动选定」是**明确的『我要看他』意图**，优先级高于一切默认
     #   收窄 —— 所以选定者穿透「隐藏非史」「隐藏逝者」「仅显入谱」三层。
     _pinned = set(pinned_list or ()) | set(focus_list or ())
+    # ★ 2026-10-04 使用者拍板（时间家谱孤立非史实节点）：「父链向上连通」——
+    #   选定/钉住者的**祖先链**一并豁免滤镜，否则「仅显所选」只留选定者+
+    #   男性后裔，祖先被挡，选定的人在画布上悬空成孤点（实测：纪黯的父亲
+    #   纪信是史实人物，仍被仅显所选挡掉）。链沿「事实父 → 事实母 → 推定父」
+    #   向上走到根；无父记录的散人依旧无链可连（数据没有边）。
+    if _pinned:
+        _pinned |= _ancestor_chains(people, _pinned)
     visible_people |= (_pinned & set(people))    # 选定者豁免「隐藏非史」
 
     # 隐藏已故：death 字段非空即已故（与已故涂灰同一判据）
@@ -317,7 +440,10 @@ def compute_layout(people, scale, hidden_non_historical=None,
             for s in (people[n].get("spouses") or []):
                 if s in people:
                     keep.add(s)
-        visible_people &= keep
+        # ★ 2026-10-04：选定/钉住者与其**祖先链**不被「仅显所选」裁掉
+        #   （祖先链见 `_ancestor_chains`——只显所选原会把它上面的父辈剪掉，
+        #     选定的人就成了悬空孤点）。
+        visible_people &= (keep | _pinned)
 
     # 截断显示：只保留指定人物及其后裔
     if cutoff_person and cutoff_person in people and cutoff_person in visible_people:
@@ -378,6 +504,13 @@ def compute_layout(people, scale, hidden_non_historical=None,
     # 表现为"同一个存档每次打开，族谱排布都不一样"。这里改为确定顺序。
     children: Dict[str, List[str]] = {}
     roots: List[str] = []
+    # ★ 2026-10-06 入赘家庭（女君主 + 入赘）：先识别，建树时把孩子挂母。
+    #   数据不动，只改布局解释。
+    # ★★ 2026-10-07 使用者裁定（第 2 条）：「**入赘男不要挂妻定位，按照自家
+    #   家族排序，连配偶线即可**」—— 原来入赘男 `continue` 掉（不入 children
+    #   也不进 roots），再走 `_consort_assoc` 挂到妻旁；现在取消这条，让他
+    #   按**自己的父系/家族**正常落座（配偶线由 spouses 数据照常画）。
+    _uz_kids, _matri, _chost = _uzheng_family(people)
     for name in people:
         if name in visible_people:
             children[name] = []
@@ -386,6 +519,12 @@ def compute_layout(people, scale, hidden_non_historical=None,
             continue
         info = people[name]
         associate_of = info.get("associate_of", "")
+        if name in _uz_kids:
+            # ★ 入赘孩子：姓随母 ⇒ 挂母边（不走父边）
+            m = str(info.get("mother") or "")
+            if m and m in visible_people:
+                children[m].append(name)
+                continue
         # ★ 上位者 = 事实父 → 事实母 → **推定父**（推定边参与布局，见 `_parent`）
         par = _parent(info, people)
         if par and par in visible_people:
@@ -432,28 +571,175 @@ def compute_layout(people, scale, hidden_non_historical=None,
 
     _root_order = {n: i for i, n in enumerate(roots)}   # 同优先级时保持存档顺序
 
+    # ★★ 2026-10-11 使用者：「**同姓同氏的根节点依次按爵位高低、始祖生卒年排序，
+    #   然后才是不同姓同氏的按爵位排序**」。同姓同氏 = 同一个**家族框键**
+    #   （`families`：成员 → 家族键，判据与世系框同一份）；爵位由视图经
+    #   `fam_ranks` 传入（`gongqing.family_ranks`：卿室=卿，公室/宗室=本国现行爵位）。
+    #   没传家族信息时整段退化成原行为（零改动、零风险）。
+    _fam_map = dict(families) if families else {}
+    _fr_ranks = fam_ranks or {}
+
+    def _root_birth(name):
+        """始祖生卒年排序键：生年数值；无生年排最后。"""
+        b = str((people.get(name) or {}).get("birth") or "").split(",")[0]
+        try:
+            return int(b)
+        except (ValueError, TypeError):
+            return 10 ** 9
+
+    _clan_memo = {}      # 「整支主姓」缓存（见 line_clan）；一次绘制只算一遍
+
     def get_root_sort_key(name):
-        """根节点排序键（元组，逐级比较）：手动祖序 → 世系（按拼音）→ 姓氏序 → 其余。"""
+        """根节点排序键（元组，逐级比较）：
+        手动祖序 → 少数民族孤根 → **家族（同姓同氏，按爵位↔生卒年）**
+        → 世系（按拼音）→ 姓氏序 → 存档顺序。"""
         # ★ 2026-09-26 使用者要求：「**少数民族孤根放风巢皇节点的右侧去**」。
         #   声明 `root_group == "separate"` 的根（素和古尔本 + 藏族三支）
         #   一律**排到最后** ⇒ 画布上落到最右端（风巢皇那棵大树的右臂之外），
         #   不再夹在树中间碍事。标由 `tools/guess_lineage.py --apply` 写。
-        if (people[name].get("root_group") or "") == "separate":
-            return (9, 0, b"", 0)
         rs = people[name].get("root_sort", 0)
         if rs > 0:
-            return (0, rs, b"", 0)
-        lin = _root_lineage(name)
-        if lin:
-            return (1, 0, _pinyin_key(lin), 0)
+            return (0, rs, b"", 0, 0, "")
+        if (people[name].get("root_group") or "") == "separate":
+            return (9, 0, b"", 0, 0, "")
+        # ★★ 2026-10-11 使用者：「不是说**风巢皇的家族谱是 1 号节点**……吗？」
+        #   实测风巢皇排到了**第 10**（前 6 是 翟洛甘/妫叔/妘适/旺秋鲁赞/妘行南/缯贺，
+        #   全带 `lineage_name`）。真因：风巢皇的 `lineage_name` 早在「共同远祖」
+        #   那批修复里被清成**空**了 ⇒ 走到姓氏序；而姓氏序（`ROOT_SURNAME_ORDER`
+        #   里 **风 = 1**，本来就是"风排最前"的设计）被排在了**世系之后** ⇒ 被压下去。
+        #   ⇒ **姓氏序提到世系之前**：风巢皇那棵大树仍是第 1 号。
         for surname, order in ROOT_SURNAME_ORDER.items():
             if name.startswith(surname):
-                return (2, order, b"", 0)
-        return (3, 0, b"", _root_order.get(name, 0))
+                return (1, order, b"", 0, _root_birth(name), name)
+        lin = _root_lineage(name)
+        if lin:
+            return (2, 0, _pinyin_key(lin), 0, _root_birth(name), name)
+        _fk = _fam_map.get(name, "")
+        if _fk:
+            # 组间：爵位降序 → 家族键（保证同族相邻、同爵时次序确定）；
+            # 组内：爵位 → 始祖生卒年 → 姓名。
+            return (3, -_fr_ranks.get(_fk, 0), str(_fk).encode("utf-8", "replace"),
+                    0, _root_birth(name), name)
+        # ★ 孤立节点（无姓氏序、无世系、无家族、又**没有子女**）**殿后**。
+        if not children.get(name):
+            return (8, 0, b"", _root_order.get(name, 0), _root_birth(name), name)
+        # ★★ 2026-10-11 使用者：「**同姓同氏的排一起 —— 徐氏隔得远**」。
+        #   兜底档原第一键是 `b""`（＝整档只按**存档顺序**）⇒ 既无 `lineage_name`
+        #   又不在公卿家族里的**同姓根**被打散到几十位之外（实测《秦末起义》三条
+        #   徐氏根：`嬴章禹`=第51位、`徐迈2`=第118位、`徐毅2`=第170位）。
+        #   ⇒ 兜底档第一键改成**整支主姓**（`line_clan`：根＋全部后裔最常见的姓名
+        #   首字，能认出「嬴姓徐氏」这种**根用姓、后用氏**的支）＋拼音序；
+        #   段内仍按存档序。只用谱内自带的名字，不新增字段、不改上层档位。
+        return (4, 0, _pinyin_key(line_clan(children, name, _clan_memo)),
+                _root_order.get(name, 0), _root_birth(name), name)
 
     roots.sort(key=get_root_sort_key)
+
+    # ---- ★ 2026-10-06 孤儿挂靠（代际版，与时间轴同规）----------------------
+    #   无父无母（也没有 associate 锚）的节点是"根"，独立占列；同家族的家族框
+    #   按成员包围盒画 ⇒ 孤儿排得远就把框撑出十几屏
+    #   （实测：汉·刘泽距刘肥 15000px，把「秦国刘氏」框撑到 26125px 宽）。
+    #   改为**定位挂靠**：同家族里找**世代最接近**的族人当锚，孤儿作为锚的
+    #   孩子参与横向排布（y 仍由 generation 决定 ⇒ 纵位不动），
+    #   **不画血缘线**（`_draw_people` 按 `lay.attach_side` 跳过这些对）。
+    #   三条守则（照抄 `timeline.compute`）：家族里还有**世代更早**的人才挂
+    #   （始祖不挂靠）；锚不能是自己的后代（防成环）；锚不能是本轮已挂靠的
+    #   孤儿（防长链）。
+    attached: set = set()
+
+    def _year_of(t):
+        try:
+            return int(str(t or "").split(",")[0])
+        except (ValueError, TypeError):
+            return None
+
+    # ★ 2026-10-06 孤立君主 → 前任君主（继任链，使用者裁定 A）——
+    #   独立于 families：无父无母的君主（note 带帝/王/皇）不找同龄族人，
+    #   而是挂到**同称号（note 相同）的前任君主**（卒年早于自己且最近）旁。
+    #   实测：韩广（秦帝，卒-206）→ 嬴胡亥（秦帝，卒-207）；
+    #         韩淑（秦帝，现任无卒年）→ 韩广。
+    #   ⚠️ 允许锚是本轮已挂靠的君主（继任链本来就是一串）。
+    for r in sorted(roots, key=get_root_sort_key):
+        note = str((people.get(r) or {}).get("note") or "")
+        if not note or not ("帝" in note or "王" in note or "皇" in note):
+            continue
+        dy = _year_of((people.get(r) or {}).get("death"))
+        cands = []
+        for n, v in people.items():
+            if n == r or str(v.get("note") or "") != note or n not in visible_people:
+                continue
+            y2 = _year_of(v.get("death"))
+            if y2 is None or (dy is not None and y2 >= dy):
+                continue       # 前任 = 卒年更早；无卒年 = 在世，不是前任
+            cands.append((y2, n))
+        if cands:
+            cands.sort(reverse=True)            # 卒年最近的
+            host = cands[0][1]
+            children.setdefault(host, []).append(r)
+            children[host].sort(key=_sib_key)
+            attached.add(r)
+            lay.attach_side[r] = host
+    if attached:
+        roots = [n for n in roots if n not in attached]
+
+    if families:
+        fam_of = dict(families)
+        # 锚**优先选「已经长在树里」的族人**（有父/有子），不选同样是孤儿的
+        # 离群者 —— 实测教训：刘泽第一版被挂到「刘琳」名下（她本身也是散在
+        # 远处的那一批），x 几乎没动、框照样被撑到 26125px。
+        _orphans = set(roots)
+
+        def _gen_of(n):
+            g = (people.get(n) or {}).get("generation", 0) or 0
+            return g if g > 0 else None
+
+        for r in sorted(roots, key=get_root_sort_key):
+            fam = fam_of.get(r)
+            if not fam:
+                continue
+            gr = _gen_of(r)
+            mates = [n for n, k in fam_of.items()
+                     if k == fam and n != r and n in visible_people
+                     and n not in attached]
+            if not mates:
+                continue
+            _gs = [g for g in (_gen_of(m) for m in mates) if g is not None]
+            if gr is not None and _gs and gr <= min(_gs):
+                continue                     # 家族里世代最早者 = 始祖，不挂靠
+            desc, stack = set(), [r]
+            while stack:                     # 自己的后代不能当锚（防成环）
+                cur = stack.pop()
+                for k2 in children.get(cur, ()):
+                    if k2 not in desc:
+                        desc.add(k2)
+                        stack.append(k2)
+            cand = [n for n in mates if n not in desc]
+            # 锚优先选**真正长在树里**的族人（有父/有母/有子）——「秦国刘氏」
+            # 里有一批靠 `associate_of` 挂着太太身份的成员（刘琳那一类），
+            # 她们自己就散在画布远处，拿她们当锚等于没挂（实测 x 一动没动）。
+            _body = [n for n in cand
+                     if (people.get(n) or {}).get("father")
+                     or (people.get(n) or {}).get("mother")
+                     or children.get(n)]
+            if _body:
+                cand = _body
+            if not cand:
+                continue
+            if gr is not None:
+                host = min(cand, key=lambda n: (abs((_gen_of(n) or gr) - gr), n))
+            else:
+                host = cand[0]
+            children.setdefault(host, []).append(r)
+            children[host].sort(key=_sib_key)
+            attached.add(r)
+            lay.attach_side[r] = host
+        if attached:
+            roots = [n for n in roots if n not in attached]
+    lay.attach_count = len(lay.attach_side)
+
     lay.children = children
     lay.roots = roots
+    lay.uz_kids = _uz_kids
 
     # 深度
     depth: Dict[str, int] = {}
@@ -462,7 +748,12 @@ def compute_layout(people, scale, hidden_non_historical=None,
         gen = people[person].get("generation", 0)
         depth[person] = gen if gen > 0 else d
         for child in children[person]:
-            calc_depth(child, depth[person] + 1)
+            # ★ 2026-10-06 挂靠者**纵位与锚同代**（挂靠借的是列位，不是血缘）：
+            #   否则没有 generation 的孤儿会被算成「锚的下一代」，白掉一层。
+            if child in lay.attach_side:
+                calc_depth(child, depth[person])
+            else:
+                calc_depth(child, depth[person] + 1)
 
     for r in roots:
         calc_depth(r, 1)
@@ -498,6 +789,8 @@ def compute_layout(people, scale, hidden_non_historical=None,
     for name in people:
         if name not in visible_people:
             continue
+        # ★ 2026-10-07 使用者裁定（第 2 条）：入赘男不再「跟妻子旁边」——
+        #   他按自家家族排序（`_consort_assoc` 已取消，见建树处说明）。
         ref = people[name].get("associate_of", "")
         if ref and ref != name and ref in visible_people:
             associate_groups.setdefault(ref, []).append(name)
@@ -848,6 +1141,18 @@ def _lineage_groups(people, positions, use_lineage):
                 continue                        # ④ 混进来的先世/别家 → 整块丢
             start = _block_start(b, kings)
             keep = _descendants(start, set(b))
+            # ★ 2026-10-04 使用者报：「冯国世系（冯伯）**没把第二代冯伯框进去**」。
+            #   实测定因：冯代 `fief_gen=2`（**第二代冯伯**），可他父亲是冯无择、
+            #   也就是始封君冯解敢的**弟弟** ⇒ 他**不是**始封君的后裔 ✗。
+            #   而原规则「成员 = 起点 + 其父系后裔」只认**一个**起点 ⇒ 冯代**整支**
+            #   出框（他连自己的框都没有 —— `clusters_of` 还会把单人簇丢掉）。
+            #   ⇒ 修正：块内**每一位受封者**（`fief_gen > 0`）连同其后裔都进框。
+            #   **不变的是**「受封之前的先世不进框」：未受封的先世（`fief_gen=0`）
+            #   既不是起点、也不是任何受封者的后裔 ⇒ 仍然留在框外
+            #   （实测冯世系里姬/毕/魏那 40 位先世照旧不进 ✓）。
+            for k in kings:
+                if k != start:
+                    keep |= _descendants(k, set(b))
             if keep:
                 groups.append((start, keep))
         if not groups:
@@ -887,7 +1192,8 @@ def _lineage_groups(people, positions, use_lineage):
     return out
 
 
-def state_group_boxes(people, lay, tier_colors, tier_priority=None, tier_of=None):
+def state_group_boxes(people, lay, tier_colors, tier_priority=None, tier_of=None,
+                      groups=None, titles=None):
     """计算"国世系 / 卿世系"虚线框。返回 (state_boxes, qing_boxes)。
 
     每项：(min_x, min_y, max_x, max_y, 颜色, 标题)
@@ -918,46 +1224,66 @@ def state_group_boxes(people, lay, tier_colors, tier_priority=None, tier_of=None
     #   使用者手填的封国要出框，走**联动**：保存封国时同步写 lineage_name。
     #   老档（整个谱牒没有一个 lineage_name）仍回退 state_name 以兼容旧数据。
     use_lineage = any(v.get("lineage_name") for v in people.values())
-    state_all = _lineage_groups(people, positions, use_lineage)
-
+    # ★ 2026-10-04：`groups` 有值时**直接用现成分组**（= `gongqing.frame_groups`
+    #   给的**家族框**：公室「X公族」/ 宗室「X国」/ 卿室「X氏」），跳过世系推导。
+    #   两个家谱（代际 / 时间轴）共用同一份判据，口径一致。
+    family_mode = groups is not None
+    state_all = (dict(groups) if family_mode
+                 else _lineage_groups(people, positions, use_lineage))
+    # ★ 2026-10-07 **撤销「同名标题合并」**（使用者纠正：两家不同家族编号的公卿
+    #   家族必须**各画一框**；当初的依据「续四十六」是误引，详见
+    #   `state_group_boxes_timeline` 同处说明）。
     def edges_of(m):
         left = positions[m][0] - actual_name_width / 2
         return left, left + cell_width(m)
 
     def clusters_of(members):
-        """按横向邻近度把同一封国的人分成几簇。
+        """**同一世系永远只画一个框**（★ 2026-10-04 使用者裁定：「**一律不分簇**」）。
 
-        史实人物按规则会从别的支系收进来，同国的人未必连成一片：
-        幽国有 7 人在 x≈7800，另有一个史实人物落在 x≈6174 —— 若按整体取
-        包围盒，虚线框会横跨半个画面。分簇后各画各的，框才贴着世系本身。
+        沿革（三批走完，别再走回头路）：
+          · **续四十四**：冯家有两位受封者（冯解敢 `fief_gen=1`、冯代 `fief_gen=2`，
+            冯代是始封君的**侄子**、不是其父系后裔）⇒ 块规则「成员 = 起点 + 其父系
+            后裔」只认一个起点 ⇒ 冯代整支出框。已改为「块内**每一位**受封者连同
+            其后裔都进框」。
+          · **续四十五 / 四十六**：分簇会画出**两个**「冯世系」框 ⇒ 使用者：
+            「为什么画两个世系？你把世系框往外框住不就行了」；先改成"优先整组"，
+            再留一道"20 个节点宽的离谱闸"。
+          · **本批**：使用者定案「**一律不分簇**」⇒ 闸门取消，**永远返回整组**。
+            框往外扩，把该世系所有人一起框住。
 
-        判据取「隔开 4 个节点宽」才算断开，比这近的一律算同一片：
-        实测正常世系内部的相邻间隔都在 1 个节点宽以内（风国 80 人最大才 312px），
-        而真正飞出去的人是隔了几千像素，两者差一个数量级，不会误判。
+        代价（使用者已知并接受）：《全史存档》里「方雷」3 人彼此隔着 31303 px
+        （≈256 个节点宽）、「有熊」183 人隔 16085 px（≈134 倍）⇒ 那类世系的框
+        会横跨**十来个屏幕**、中间大片留白。
+
+        ⚠️ 老逻辑（按横向邻近度分簇：阈值 `node_w * 4`；全拆成单人时再按
+        `node_w * 12` 跨度决定画不画）**已整体删除**，原文保存在
+        `项目日志.md` **续四十七批**，需要时原样粘回。
+
+        注：**单人世系**（该世系只剩 1 人）仍不画框 —— 那与分簇无关，
+        由调用处的 `if len(group) < 2: continue` 把关。
         """
-        items = sorted(members, key=lambda m: edges_of(m)[0])
-        out, cur = [], [items[0]]
-        for m in items[1:]:
-            if edges_of(m)[0] - edges_of(cur[-1])[1] > lay.node_w * 4:
-                out.append(cur)
-                cur = [m]
-            else:
-                cur.append(m)
-        out.append(cur)
-        # 全都拆成单人时说明本来就只有两三个人在两头（如「凤鸿」就 2 个人），
-        # 这时候拆开等于把这个世系的框整个弄丢 —— 只要他们本来就挨着，就照原样画。
-        # 但隔着几十个节点宽的不算（秦末档里「季」「利」各 2 人、隔着一万多像素），
-        # 那种整框画出来是个横跨半个画面的空框，不如不画。
-        if all(len(c) < 2 for c in out):
-            span = edges_of(items[-1])[1] - edges_of(items[0])[0]
-            return [items] if span <= lay.node_w * 12 else []
-        return [c for c in out if len(c) >= 2]
+        return [sorted(members, key=lambda m: edges_of(m)[0])]
 
     state_boxes = []
     qing_boxes = []
     for sn, members in state_all.items():
+        # ⚠️⚠️ 2026-10-04 **真凶修复**：家族分组的成员来自**存档的家族名册**，
+        #   未必都在当前布局的 `positions` 里（被隐藏的非史实、未入谱的人…）。
+        #   老路径的世系分组是从 `positions` 反推的（`_lineage_groups` 里
+        #   `for n in positions`）⇒ 天然安全；家族分组没有这层保护 ⇒
+        #   `clusters_of` 里的 `edges_of(m) → positions[m]` 会 **KeyError** ✗ ⇒
+        #   被视图的 try/except 吞掉 ⇒ **整批框一个都不画**（使用者实测：
+        #   「看不到框」就是这个）。
+        #   ⇒ **必须在这里先过滤**（放进循环内已经太晚 —— `clusters_of` 先跑）。
+        members = [m for m in members if m in positions]
+        if not members:
+            continue
         for group in clusters_of(members):
-            if len(group) < 2:
+            # ★ 2026-10-04：家族模式下**不再**用「2 人成框」拦 —— 那道门槛已由
+            #   `gongqing.frame_groups` 把关（含**公室 1 人也成框**的例外：
+            #   「现在只有 1 人，以后会有后代」）。这里再拦一次会把「嬴公族」
+            #   （本档只有秦质 1 人）整框丢掉（实测 54 → 53 ✗）。
+            if len(group) < 2 and not family_mode:
                 continue
             left_edges = [edges_of(m)[0] for m in group]
             right_edges = [edges_of(m)[1] for m in group]
@@ -1014,11 +1340,15 @@ def state_group_boxes(people, lay, tier_colors, tier_priority=None, tier_of=None
                 #   框太窄时逐级退让：全称 → 只留字段值 → 不写。
                 char_w = 14 * scale
                 box_w = max_x - min_x
-                full_title = sn + "世系"
+                # 家族框标题**照搬**（「冯国」/「冯公族」/「秦刘氏」）—— 使用者：
+                # 「世系这俩字也不要了」；`titles` 映射负责「**键唯一、显示可同名**」
+                # （两家「秦刘氏」就是两家，靠 `sn` = 家族编号区分）。
+                _disp = (titles or {}).get(sn, sn) if family_mode else sn
+                full_title = _disp if family_mode else sn + "世系"
                 if box_w >= len(full_title) * char_w:
                     box_title = full_title
-                elif box_w >= len(sn) * char_w:
-                    box_title = sn
+                elif box_w >= len(_disp) * char_w:
+                    box_title = _disp
                 else:
                     box_title = ""
                 state_boxes.append((min_x, min_y, max_x, max_y,
@@ -1029,7 +1359,9 @@ def state_group_boxes(people, lay, tier_colors, tier_priority=None, tier_of=None
             #   又画「X卿」内框，同一批人套两个框。修：**只有整组全是卿**
             #   （纯卿族，如「姜姓高氏」）才画卿内框；只要组里有非卿（是国/君族）
             #   就只画世系大框 —— 一组最多一个框。
-            if has_qing and all_qing:
+            # 家族模式下**不画**「X卿」内框：卿室家族本身已经是一个「X氏」框了，
+            # 再套一层就是当初那个「一个意思两个框」的老 bug（见上面注释）。
+            if has_qing and all_qing and not family_mode:
                 qleft = [edges_of(m)[0] for m in qm]
                 qright = [edges_of(m)[1] for m in qm]
                 qys = [positions[m][1] for m in qm]
@@ -1047,7 +1379,8 @@ def state_group_boxes(people, lay, tier_colors, tier_priority=None, tier_of=None
 
 
 def state_group_boxes_timeline(people, positions, widths, card_h, tier_colors,
-                               tier_priority=None, char_w=8.0, tier_of=None):
+                               tier_priority=None, char_w=8.0, tier_of=None,
+                               groups=None, titles=None):
     """★ 2026-09-23 时间轴版「X国世系」虚线框。
 
     时间轴的坐标系与主树不同：卡片以**中心 x、顶部 y** 定位，宽度按人各异
@@ -1075,11 +1408,32 @@ def state_group_boxes_timeline(people, positions, widths, card_h, tier_colors,
     # ★ 2026-09-23 与主树同规：认 `lineage_name`（君族），老档回退 state_name
     #   （见 state_group_boxes 处的说明）
     use_lineage = any(v.get("lineage_name") for v in people.values())
-    state_all = _lineage_groups(people, positions, use_lineage)
-
+    # ★ 2026-10-04：`groups` 有值 ⇒ 直接用它（家族框，与代际同一份判据）。
+    family_mode = groups is not None
+    state_all = (dict(groups) if family_mode
+                 else _lineage_groups(people, positions, use_lineage))
+    # ★ 2026-10-07 **撤销「同名标题合并」**（使用者纠正）：
+    #   上一版把**同名不同家族编号**的两家并成一个框（如「秦国赵氏」= fam1000140
+    #   ＋ fam1000153），依据是「续四十六：为什么画两个世系？你把世系框往外框住
+    #   不就行了」—— **那是误引**：那条裁定说的是 `clusters_of` 把**同一个世系**
+    #   拆成两个框（见该函数沿革）。使用者本轮明确：「**这是两个公卿家族**，
+    #   我当时说要分开了吗？」⇒ **一家一框**（`frame_groups` 的 key 唯一，
+    #   重复 key 实测 0 个 ⇒ 不会退回「双份」）。
     boxes = []
     for sn, members in state_all.items():
-        if len(members) < 2:
+        # ⚠️⚠️ 同 `state_group_boxes`：家族成员未必都在 `positions` 里，
+        #   不过滤就会 `positions[m]` KeyError ⇒ 整批框不画（实测踩过）。
+        members = [m for m in members if m in positions]
+        # ★ 2026-10-07 修「时间家谱一个家族框都画不出来」：家族模式下只判了
+        #   `len < 2 and not family_mode`，**漏了 len == 0** —— 只要有**一家**
+        #   的成员被筛光（默认勾着「仅显入谱」时很常见），下面的 `min(lefts)`
+        #   就 `ValueError: min() iterable argument is empty`，被 rerender 的
+        #   `except Exception: pass` 静默吞掉 ⇒ **整批框一起不画**（实测框数 = 0）。
+        if not members:
+            continue
+        # ★ 2026-10-04：家族模式下门槛已由 `frame_groups` 把关（公室 1 人也成框），
+        #   这里不再拦（否则「嬴公族」会被整框丢掉）。
+        if len(members) < 2 and not family_mode:
             continue
         # ★ 2026-09-23 修「时间轴一个世系框都画不出来」（实测框数 = 0）：
         #   主树那套 `clusters_of` 按**横向**邻近度拆簇，因为主树里同代人横向
@@ -1113,17 +1467,22 @@ def state_group_boxes_timeline(people, positions, widths, card_h, tier_colors,
 
         box_w = max_x - min_x
         # ★ 2026-09-23 与主树同规：框题 = 字段值 + 「世系」，不自动补「国」
-        full = sn + "世系"
+        # ★ 2026-10-04：家族模式下标题**照搬**（「冯国」/「冯公族」/「秦刘氏」）——
+        #   使用者：「世系这俩字也不要了」；`titles` 负责「键唯一、显示可同名」。
+        _disp = (titles or {}).get(sn, sn) if family_mode else sn
+        full = _disp if family_mode else sn + "世系"
         if box_w >= len(full) * char_w + 6:
             title = full
-        elif box_w >= len(sn) * char_w + 6:
-            title = sn
+        elif box_w >= len(_disp) * char_w + 6:
+            title = _disp
         else:
             title = ""
         # ★ 2026-09-26 与主树同规：全「卿」的组（某国卿大夫家族）不是国，
         #   不按「始封君世系」画框 —— 题改「X卿」、色用卿色（与八十二批的
         #   卿内框同语义；时间轴没有内外两框机制，直接给出卿框）。
-        if members and all(
+        # 家族模式下**不再**把「全卿组」改题「X卿」+ 卿色：卿室家族本身就是
+        # 一个「X氏」框（颜色也已在 `frame_groups` 侧定好）。
+        if not family_mode and members and all(
                 ((tier_of or {}).get(m) or people.get(m, {}).get("fief_title", ""))
                 == "卿" for m in members):
             color = tier_colors.get("卿", color)

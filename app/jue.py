@@ -346,6 +346,47 @@ def _guo_jue_of(info, era: str = "") -> str:
     return ""
 
 
+# 朝代号（用于判断「尊号点名的朝代」与「本人所处朝代」是否一致）。
+# 取粗朝代名，顺序 = 由早到晚 **不重要**（只取第一个命中的）。
+_DYNASTY_WORDS = ("上古", "夏", "商", "周", "秦", "汉", "三国", "晋",
+                  "南北朝", "隋", "唐", "五代", "宋")
+
+
+def _zunhao_live(info, era: str) -> str:
+    """本档**可用**的尊号爵称 —— 尊号里点名的朝代与本人所处朝代不符时作废。
+
+    ★ 2026-10-11 使用者（附截图）：「**汉惠帝刘盈其实是历史上的大汉皇帝，
+      但在这个时代他就是普通人**，却给他标帝色了，好像这样的问题反复出现」。
+
+      根因：`note`（尊号）在本档里可能装着**后世 / 预置的历史头衔** ——
+      《大周列国志》的 Memorial 尊号字段会给尚未即位的名人也预置「汉惠帝」
+      这类谥号；而 `tier_for` 一直在拿它当爵位兜底 ⇒ 把**本档尚未发生的
+      头衔**当成了现职（实测《秦末起义》刘盈：生 -210 属秦，尊号「汉惠帝」
+      → 被染成**帝**色，红框）。
+
+      判据：尊号里若点了**朝代名**，它必须与本人所处的朝代**一致** ——
+      不一致（人在秦、尊号却是「汉惠帝」）说明那是后世追谥，本档不上色。
+      ⚠️ **本档有君主实据的人不受此限**（君序 `fief_gen` / 继位记录
+      `Ren_Ji_Wei_Time` / 天子世系）：他确实在本档当过君 —— 如《全史存档》
+      刘秀（汉·「汉光武帝」，朝代相符）、姬昌（「周文王」在本档就是王）。
+      ⚠️ 只挡「帝 / 王」两级：公侯伯子男是常见诸侯号（「淮南王」「楚王」
+      这类带国名的更不该误伤），且本档实爵优先，动不到它们。
+    """
+    r = info or {}
+    zh = zunhao_tier(r.get("note"), r.get("zunhao"))
+    if zh not in ("帝", "王"):
+        return zh
+    ex = r.get("extra") if isinstance(r.get("extra"), dict) else {}
+    if (ex or {}).get("Ren_Ji_Wei_Time") or r.get("Ren_Ji_Wei_Time") \
+            or (r.get("fief_gen") or 0) > 0 or is_tianzi(r, era):
+        return zh                      # 本档有君主实据 ⇒ 尊号属实，照用
+    text = str(r.get("note") or "") + str(r.get("zunhao") or "")
+    tok = next((d for d in _DYNASTY_WORDS if d in text), None)
+    if tok and tok != coarse_era(era):
+        return ""                      # 朝代号对不上 ⇒ 后世追谥，本档不用
+    return zh
+
+
 def tier_for(info, era: str = "") -> str:
     """**上色用的爵称**（第 1~3 条口径的唯一出口）。
 
@@ -356,9 +397,11 @@ def tier_for(info, era: str = "") -> str:
     """
     r = info or {}
     t = str(r.get("fief_title") or "")
-    zh = zunhao_tier(r.get("note"), r.get("zunhao"))
     e = era or era_of_info(r)
     c = coarse_era(e)
+    # ★ 尊号先过「朝代是否对得上」这道闸（见 `_zunhao_live`）—— 本档尚未
+    #   发生的头衔（如刘盈的「汉惠帝」）不能当爵位上色。
+    zh = _zunhao_live(r, e)
     # ⓿ 卿族（某国的卿大夫家族）→ 专门的「卿」色。放在最前：卿族本来就不该
     #    拿国君的爵位色（实测「子姓皇氏」的人会被国爵表带成「王」，是错的）。
     if is_qing_clan(r):

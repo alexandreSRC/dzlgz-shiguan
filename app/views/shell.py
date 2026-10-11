@@ -275,7 +275,7 @@ class StatusBar(tk.Frame):
         self.items = {}
         self.colors = {}
 
-        self._add("counts", "实录 — · 谱牒 —", color="dual")
+        self._add("counts", "实录 — ｜ 谱牒 —", color="dual")
         self._add("sel", "未选中")
         # ★ 2026-09-26：家谱 / 时间轴 / 表格页的**完整统计句**都写这一格
         #   （谱内 N 人 · 根节点 R · 可见 A–B 代 / 时间轴视口… · 连线 K 条 /
@@ -313,7 +313,7 @@ class StatusBar(tk.Frame):
             return
         rt = "—" if record is None else f"{record}"
         bt = "—" if book is None else f"{book}"
-        lab.configure(text=f"实录 {rt}　·　谱牒 {bt}", fg=self.theme.text)
+        lab.configure(text=f"实录 {rt} ｜ 谱牒 {bt}", fg=self.theme.text)
 
 
 class Sidebar(tk.Frame):

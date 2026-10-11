@@ -20,6 +20,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from . import dpi as _dpi
+from .pinyin import initial as _pinyin_initial
+from .theme import TIER_PRIORITY
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 # ==================================================================== 常量
@@ -338,6 +340,12 @@ class Layout:
     # ★ 2026-09-22 母亲连线：attach_mother = 挂在母亲枝下的子（无父，主线即母线，
     #   画虚线）；_mother_pair_of = 父母都在时「母亲 → 子」的额外虚线（母线 keyed by 子）。
     attach_mother: set = field(default_factory=set)
+    # ★ 2026-10-06 孤儿挂靠：无父无母的史实节点原是"根"，独立占列，把同家族
+    #   的世系框撑得很宽（实测：汉·刘泽）。改为定位挂靠到同家族生年最近的
+    #   族人旁（同代人同族），**只定位不画线**（挂靠不是血缘）。attach_side =
+    #   {孤儿: 锚}；_build_link_pairs 对这些对不产线。
+    attach_side: Dict[str, str] = field(default_factory=dict)
+    attach_count: int = 0
     mother_extra: List[Tuple[str, str]] = field(default_factory=list)
     _mother_pair_of: Dict[str, Tuple[str, str, float, float, float, float]] = field(default_factory=dict)
 
@@ -432,7 +440,12 @@ class Layout:
 
 def compute(people, scale: float = SCALE_DEFAULT,
             width_of: Callable[[str], float] = card_width,
-            sib_gap: float = SIB_GAP, card_h: float = CARD_H) -> Layout:
+            sib_gap: float = SIB_GAP, card_h: float = CARD_H,
+            families: Optional[Dict[str, str]] = None,
+            tiers: Optional[Dict[str, str]] = None,
+            succession: Optional[Dict[str, str]] = None,
+            guo_rank: Optional[Dict[str, int]] = None,
+            fam_ranks: Optional[Dict[str, int]] = None) -> Layout:
     """算时间轴布局。people 为 {姓名: 人物 dict}，与 model 的字段一致。
 
     `card_h` 跟着铭牌样式走（横排 17 / 竖排 54）—— 卡片高度决定了同列最小间距，
@@ -470,11 +483,23 @@ def compute(people, scale: float = SCALE_DEFAULT,
     parent_of = {}
     attach_mother = set()
     mother_extra: List[Tuple[str, str]] = []
+    # ★ 2026-10-06 入赘家庭 + 女君主归世系（一百一十二批口径，时间轴补齐）：
+    #   母系家主（女 + 自立门户 + 孩子姓随她）的孩子**挂母**（姓随母，只画
+    #   母线）。数据不动。
+    # ★★ 2026-10-07 使用者裁定（第 2 条）：「**入赘男不要挂妻定位，按照自家
+    #   家族排序，连配偶线即可**」—— 取消原来的「脱离父系 + 挂妻旁」，让入赘男
+    #   照常走自己的父系边（无父才成根，由自家家族排序落座）；配偶线由
+    #   `spouses` 数据在 `_draw_links` 里照常画。
+    from .layout import _uzheng_family
+    _uz_kids, _matri, _chost = _uzheng_family(people)
     for n in years:
         f = ((people.get(n) or {}).get("father") or "")
         m = mother_of[n]
         f_in = f in years and f != n
         m_in = m in years and m != n
+        if n in _uz_kids and m_in:
+            parent_of[n] = m                    # 入赘孩子：挂母（只画母线）
+            continue
         if not f_in and m_in:
             parent_of[n] = m
             attach_mother.add(n)
@@ -482,6 +507,15 @@ def compute(people, scale: float = SCALE_DEFAULT,
             parent_of[n] = f
         if m_in and parent_of[n] != m:
             mother_extra.append((m, n))
+    # 配偶位次（`associate_rank`，代际树同款口径）：同一锚点下多个配偶按它从左到右。
+    # 没有这个字段的人一律 999 ⇒ 兄弟排序退化成原来的「生年 + 名字」，不改变旧行为。
+    def _arank(n: str) -> int:
+        v = (people.get(n) or {}).get("associate_rank")
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 999
+
     kids, roots = {}, []
     for n in years:
         p = parent_of[n]
@@ -490,10 +524,241 @@ def compute(people, scale: float = SCALE_DEFAULT,
         else:
             roots.append(n)
     for p in kids:
-        kids[p].sort(key=lambda n: (years[n], n))
+        kids[p].sort(key=lambda m: (years[m], _arank(m), m))
     roots.sort(key=lambda n: (years[n], n))
     lay.attach_mother = attach_mother
     lay.mother_extra = mother_extra
+
+    # ---- ★ 2026-10-07 使用者（续七十一）：**配偶同代人挂靠**（时间轴补齐代际口径）----
+    #   症状：一批「无父无母的非史女性」（谱内某人的妻 / 母）在**代际树**里早有
+    #   `associate_of`（`tools/attach_lone_wives.py` 批量补的；代际据此不作根、
+    #   挨着丈夫排），但**时间轴不认这个字段** ⇒ 她们仍当"根"被排到画布最右端，
+    #   一个个孤立无连线（实测 22 人挤在 x 2.05 万~2.27 万）。
+    #   这里补上：`associate_of` 的锚在时间轴内 ⇒ 不作根、挂进锚的子树
+    #   （**只定位不画线** —— 与孤儿挂靠同一条约定；夫妻线由 `spouses` 照常画）。
+    # ★★ 2026-10-11 使用者（第 1 条）：「**全谱史实没做时间家谱吗？**」——
+    #   做了，但《全史存档》上**崩了**：`_build_link_pairs` 抛
+    #   `KeyError: '妇甲'`，被视图的 try/except 吞掉 ⇒ 整块画布空白，看着像"没做"。
+    #   根因是下面两处**挂靠成环**：存档里 `妇甲.associate_of=黎真`、
+    #   `黎真.associate_of=妇乙`、而 `妇乙.father=妇甲` ⇒ 三者互挂成一个环，
+    #   **没有一个还是根** ⇒ 从 roots 出发谁都走不到 ⇒ 拿不到坐标。
+    #   （孤儿挂靠那一段本来就有 `desc` 防环，只有这两处漏了。）
+    def _would_cycle(n, anchor):
+        """把 n 挂到 anchor 名下会不会成环 —— anchor 是 n 的后代（或自身）就会。
+
+        沿 `parent_of` 从 anchor **向上**走：`parent_of` 在本块循环里是**边挂边写**的，
+        所以能反映本轮已经做过的挂靠（正是成环的来源）。
+        """
+        cur, seen = anchor, set()
+        while cur:
+            if cur == n:
+                return True
+            if cur in seen:
+                return False          # 原本就有环：不再往里套
+            seen.add(cur)
+            cur = parent_of.get(cur, "")
+        return False
+
+    for n in list(roots):
+        a = str((people.get(n) or {}).get("associate_of") or "")
+        if not a or a == n or a not in years:
+            continue
+        if _would_cycle(n, a):
+            continue                  # 挂上去会成环 ⇒ 让他自己当根（宁散勿崩）
+        parent_of[n] = a
+        kids.setdefault(a, []).append(n)
+        kids[a].sort(key=lambda m: (years[m], _arank(m), m))
+        lay.attach_side[n] = a
+        roots.remove(n)
+
+    # ★ 2026-10-07 同批（使用者第 5 条）：**史实的孤女也挂丈夫旁**。
+    #   `associate_of` 只有**非史**女性被批量补过（`tools/attach_lone_wives.py`
+    #   的判据里 `is_hist` 直接跳过），所以史实的孤女仍是孤根 —— 实测「戚姬」
+    #   （史=是 · 无父无母 · 夫=萧何）就落在画布最右端、一条线都没有。
+    #   兜底口径：**女 + 无父无母 + 有夫在轴上** ⇒ 挂到丈夫（只定位不画线）。
+    #   ⚠️ 两道护栏，缺一不可：
+    #     · **君主**（note 带帝/王/皇，如韩淑）**跳过** —— 她要走下面的继任链，
+    #       否则三秦帝会被拆开；
+    #     · **母系家主**（入赘家庭的女君主，见 `_uzheng_family`）**跳过** ——
+    #       把她挂到丈夫名下会把整个入赘家庭拆散（一百一十二批踩过）。
+    def _husband_of(n):
+        cand = [s for s in ((people.get(n) or {}).get("spouses") or [])
+                if s in years and s != n]
+
+        def key(s):
+            lst = (people.get(s) or {}).get("spouses") or []
+            return (lst.index(n) if n in lst else 999, s)
+        return min(cand, key=key) if cand else ""
+
+    for n in list(roots):
+        v = people.get(n) or {}
+        if str(v.get("gender") or "") != "女" or n in _matri:
+            continue
+        note = str(v.get("note") or "")
+        if "帝" in note or "王" in note or "皇" in note:
+            continue
+        a = _husband_of(n)
+        if not a:
+            continue
+        if _would_cycle(n, a):
+            continue                  # 同上：挂到后代名下会成环
+        parent_of[n] = a
+        kids.setdefault(a, []).append(n)
+        kids[a].sort(key=lambda m: (years[m], _arank(m), m))
+        lay.attach_side[n] = a
+        roots.remove(n)
+
+    # ---- ★ 2026-10-06 孤立君主 → 同称号前任（继任链，一百一十二批裁定 A）----
+    #   无父无母的君主（note 带帝/王/皇）挂到**同 note 的前任**（卒年早于自己
+    #   且最近）旁；锚允许是本轮已挂靠的君主（继任链本来就是一串）。
+    #   只定位不画线（attach_side）。
+    for r in sorted(list(roots), key=lambda n: (years.get(n, 0), n)):
+        note = str((people.get(r) or {}).get("note") or "")
+        if not note or not ("帝" in note or "王" in note or "皇" in note):
+            continue
+        dy = to_int(str((people.get(r) or {}).get("death") or "").split(",")[0]
+                    ) if isinstance((people.get(r) or {}).get("death"), str) else None
+        cands = []
+        for n, v in people.items():
+            # ★ 入赘男（_chost）不是君主线的人：他们的 note 可能也是「秦帝」，
+            #   但继任链只连**君主**（实测：韩淑差点锚到她丈夫龙且）。
+            if n == r or n not in years or n in _chost:
+                continue
+            if str(v.get("note") or "") != note:
+                continue
+            y2 = to_int(str(v.get("death") or "").split(",")[0]
+                        ) if isinstance(v.get("death"), str) else None
+            if y2 is None or (dy is not None and y2 >= dy):
+                continue                        # 前任 = 卒年更早（无卒年 = 在世）
+            cands.append((y2, n))
+        prev = (succession or {}).get(r)
+        if prev and prev in years and prev != r:
+            # ★ 权威继任顺序（King_Str）命中 ⇒ 直接挂前任，不走启发式
+            lay.attach_side[r] = prev
+            kids.setdefault(prev, []).append(r)   # 挂进锚的子树（否则整棵不落位）
+            roots = [n for n in roots if n != r]
+            continue
+        if cands:
+            cands.sort(reverse=True)            # 卒年最近的当锚
+            lay.attach_side[r] = cands[0][1]
+            kids.setdefault(cands[0][1], []).append(r)   # 挂进锚的子树（否则整棵不落位）
+            roots = [n for n in roots if n != r]
+
+    # （2026-10-07：入赘男「挂妻定位」已按使用者裁定取消 —— 见建环处说明）
+
+    # ---- ★ 2026-10-06 孤儿挂靠（使用者提案：「挂在同家族年龄相近的人旁边
+    #      当同代人中的同族」）------------------------------------------------
+    # 无父无母的史实节点是"根"，独立占列；同家族的世系框按成员包围盒画，
+    # 孤儿排得远就把框撑得很宽（实测：汉·刘泽把框撑出十几屏）。
+    # 改为**定位挂靠**：同家族里找生年最近的族人当锚，孤儿作为锚的"孩子"
+    # 参与子树布局（在自己的生年纵位上、锚旁边的列），**不画父子线**
+    # （_build_link_pairs 对 attach_side 里的对不产线 —— 挂靠不是血缘）。
+    # 三条守则：家族里还有更早的人才挂（始祖不挂靠）；锚不能是自己的后代
+    # （防成环）；锚不能是本轮已挂靠的孤儿（防长链）。
+    if families:
+        # `families` = {成员名: 家族键}（扁平映射，视图从 frame_groups 摊平传来）
+        fam_of = dict(families)
+        attached: set = set()
+        for r in sorted(roots, key=lambda n: (years[n], n)):
+            fam = fam_of.get(r)
+            if not fam:
+                continue
+            mates = [n for n, k in fam_of.items()
+                     if k == fam and n != r and n in years and n not in attached]
+            if not mates:
+                continue
+            if years[r] <= min(years[n] for n in mates):
+                continue                        # 家族的最早者 = 始祖，不挂靠
+            desc = set()
+            stack = [r]
+            while stack:                        # 自己的后代不能当锚（防成环）
+                cur = stack.pop()
+                for k2 in kids.get(cur, ()):
+                    if k2 not in desc:
+                        desc.add(k2)
+                        stack.append(k2)
+            mates = [n for n in mates if n not in desc]
+            if not mates:
+                continue
+            host = min(mates, key=lambda n: (abs(years[n] - years[r]),
+                                             years[n], n))
+            parent_of[r] = host
+            kids.setdefault(host, []).append(r)
+            kids[host].sort(key=lambda n: (years[n], n))
+            attached.add(r)
+            lay.attach_side[r] = host
+        if attached:
+            lay.attach_count = len(attached)
+            roots = [n for n in roots if n not in attached]
+    # （无 families 时 attach_side 保留 —— 继任链/入赘男的挂靠与家族分组独立）
+    lay.attach_count = len(lay.attach_side)
+
+    # ---- ★ 2026-10-06 使用者裁定：宗支排序 = 爵位（帝>王>公>侯>伯>子>卿>
+    #      其他），同级按宗支始祖名首字拼音首字母，再同按始祖生年。--------
+    # ★ 家族爵位 = 全家族成员的最高爵（与世系框框色同一口径，tiers 兜底）。
+    # ★ 多个 framed 家族共享同一条上古祖链（实测：刘邦父链 84 代上溯到
+    #   风巢皇/伏羲氏）—— 家族是**祖树里的分支**，只排根没用 ⇒ **递归按
+    #   子树爵秩排兄弟**：节点子树秩 = 自己所属家族的爵与子孙所含家族的
+    #   爵取最大；同层兄弟按（子树秩降序，生年，名字）。家族内部全员同秩
+    #   ⇒ 生年序保留；跨家族 ⇒ 帝王分支排前。
+    # ★ 根常是「受封之前的先世」，不进家族框成员表 ⇒ 查不到 fam 就沿后代
+    #   找家族归属。
+    if families:
+        fam_members = {}
+        for n, k in fam_of.items():
+            fam_members.setdefault(k, []).append(n)
+        # ★ 2026-10-07 使用者纠错：「刘氏并不是帝级，他是公卿家族」——
+        #   原来按成员的**历史称号**（note/上色爵称）取最高爵，刘盈的
+        #   「汉惠帝」把整个卿室家族抬成了帝级 ✗。改为按 **家族类型**：
+        #   卿室 = 卿；公室/宗室 = 本国现行爵位（King_Str 最后一条的爵，
+        #   视图经 guo_rank 传入）；查不到再退成员游戏内封爵。
+        _gr = guo_rank or {}
+        _fr_ranks = fam_ranks or {}
+        fam_tier = {}
+        for k in fam_members:
+            fam_tier[k] = _fr_ranks.get(k, 0)
+
+        _sub = {}
+
+        def _sub_rank(n):
+            v = _sub.get(n)
+            if v is not None:
+                return v
+            v = fam_tier.get(fam_of.get(n, ""), 0)
+            for c2 in kids.get(n, ()):
+                v2 = _sub_rank(c2)
+                if v2 > v:
+                    v = v2
+            _sub[n] = v
+            return v
+
+        for n in years:
+            _sub_rank(n)                          # 预热（祖链最深 ≈ 百层，可控）
+        for p, ks in kids.items():
+            ks.sort(key=lambda n: (-_sub_rank(n), years[n], n))
+
+        # ★★ 2026-10-11 使用者：「**同姓同氏的根节点依次按照爵位高低、始祖生卒年
+        #   排序，然后才是不同姓同氏的按照爵位排序**」。
+        #   原来只按 `(-子树爵秩, 姓名拼音首字母, 生卒年, 名)` —— 同一姓+氏的两支
+        #   只要**子树爵秩**不同（子树里含别的家族），就会被别姓插到中间，离得很远。
+        #   ⇒ 先按**家族框**（同姓同氏＝同一个家族键）聚组：组间按家族爵位降序
+        #   （同爵再按家族名，保证确定性）、组内按爵位 → 生卒年；
+        #   无家族归属的根（上古先世那一大批）照旧沉在最后，行为不变。
+        # ★ 2026-10-11 与代际家谱同规（使用者：「同姓同氏的排一起 —— 徐氏隔得远」）：
+        #   无家族归属的根原来直接按子树爵秩排 ⇒ 同姓的两支被别姓插到中间。
+        #   ⇒ 先按**整支主姓**聚组（`layout.line_clan`，同一份判据：能认出
+        #     「嬴姓徐氏」这种根用姓、后用氏的支），组内再按爵秩→生卒。
+        from .layout import line_clan as _line_clan
+        _clan_memo = {}
+
+        def _root_key(n):
+            k = fam_of.get(n, "")
+            if not k:
+                return (2, _line_clan(kids, n, _clan_memo), "",
+                        -_sub_rank(n), years[n], n)
+            return (0, "", -fam_tier.get(k, 0), k, -_sub_rank(n), years[n], n)
+
+        roots.sort(key=_root_key)
 
     # ---- 后序：子树宽度 + 父亲居中于孩子之上 + 轮廓避让 ----
     # 轮廓按 y 分桶存「该桶内最大右边缘」，查最小不撞偏移是 O(1)。
@@ -539,23 +804,44 @@ def compute(people, scale: float = SCALE_DEFAULT,
         members.append((node, yn, node_xc, wn))
         return members, node_xc
 
+    # ---- 放置：★ 树严格从左到右依次落位（`_prev_right` = 已放内容的最右
+    #      边缘，跨所有年份带）—— 后面的树不许插进前面树在别的年份带上的
+    #      空档（原 per-y 槽位会让世系框的左右次序与排序无关，实测姒国插进
+    #      大帝族的空档排到最左）。代价：画布略宽；收益：框序 = 排序。----
     allm: List[Tuple[str, float, float, float]] = []
+    placed: List[Tuple[str, List[Tuple[str, float, float, float]]]] = []
     prof: Dict[int, float] = {}
+    _prev_right = float("-inf")
     for r in roots:
         m, _ = place(r)
         off = 0.0
+        _ml = min(x2 - w2 / 2.0 for (_, _, x2, w2) in m)
         for (_, y2, x2, w2) in m:
             need = _right_in(prof, y2) + sib_gap - (x2 - w2 / 2.0)
             if need > off:
                 off = need
+        _need_seq = _prev_right + sib_gap - _ml
+        if _need_seq > off:
+            off = _need_seq
         if off > 1e-6:
             lay.shift_count += 1
-        for (nm2, y2, x2, w2) in m:
-            allm.append((nm2, y2, x2 + off, w2))
+        mm = [(nm2, y2, x2 + off, w2) for (nm2, y2, x2, w2) in m]
+        placed.append((r, mm))
+        for (nm2, y2, x2, w2) in mm:
             b = int(y2 // card_h)
-            r = x2 + off + w2 / 2.0
-            if r > prof.get(b, float("-inf")):
-                prof[b] = r
+            r2 = x2 + w2 / 2.0
+            if r2 > prof.get(b, float("-inf")):
+                prof[b] = r2
+        _prev_right = max(_prev_right, max(x2 + w2 / 2.0
+                                           for (_, _, x2, w2) in mm))
+
+    # ---- ★ 2026-10-07 同族归拢（后置，使用者续七十裁定）----------------
+    #   同族被拆成多棵树时，把"卫星树"整体滑到本族主体旁最近的空位。
+    #   **只动卫星，不动主体** ⇒ 主线「框序 = 排序」不受影响（见 _cohere_families）。
+    if families:
+        _cohere_families(placed, fam_of, sib_gap, card_h)
+    for _, mm in placed:
+        allm.extend(mm)
 
     min_left = min(x2 - w2 / 2.0 for (_, _, x2, w2) in allm)
     for (nm, y2, x2, w2) in allm:
@@ -571,6 +857,105 @@ def compute(people, scale: float = SCALE_DEFAULT,
     return lay
 
 
+def _cohere_families(placed, fam_of, sib_gap, card_h):
+    """**同族归拢（后置）** ★ 2026-10-07 使用者裁定（续七十）。
+
+    症状（实测）：`秦国公族` 13 人横跨 x 551~18564 —— 秦帝（嬴胡亥 892 /
+    韩广 551 / 韩淑 551）在上古祖树里，宋家（宋义 18382 / 乐正克 18040 /
+    龙且 18040…）在右边一棵独立小树里（根 `子纠` 的父「子纠父」是占位祖先、
+    无生年 ⇒ 不进时间轴，链被截断）⇒ 同族被一棵 1.7 万 px 宽的巨树隔开，
+    家族框被撑成一条横贯全屏的带。
+
+    做法（**只动卫星，不动主体**）：
+      · 按家族把已落位的树分簇，某家族**跨 ≥2 簇**才处理；
+      · **主体** = 该家族最靠左的那一簇（原地不动 ⇒ 主线「框序 = 排序」不变）；
+      · **卫星** = 同族的其余簇，整簇平移，滑到主体左/右**最近的空位**；
+      · ★ 使用者口径「家族树中央除非同代人否则不允许插入别的家族成员」⇒
+        **只在本簇与主体的年份带重叠（＝同代）时才归拢**，否则原地不动；
+      · 扫描上限内找不到空位 ⇒ 原地不动（宁可不归拢，不许叠卡）。
+
+    代价：卫星原位留出空档（画布宽度不变）；收益：家族框收成一块。
+    """
+    by_fam: Dict[str, List[List[Tuple[str, float, float, float]]]] = defaultdict(list)
+    for _r, mm in placed:
+        for k in {fam_of.get(nm) for (nm, _, _, _) in mm}:
+            if k:
+                by_fam[k].append(mm)
+    if not any(len(v) > 1 for v in by_fam.values()):
+        return
+
+    def _buckets(y: float):
+        return (int(y // card_h), int((y + card_h - 0.5) // card_h))
+
+    occ: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
+
+    def _add(mm):
+        for (_, y, x, w) in mm:
+            for b in _buckets(y):
+                occ[b].append((x - w / 2.0, x + w / 2.0))
+
+    def _clear(mm):
+        for (_, y, x, w) in mm:
+            iv = (x - w / 2.0, x + w / 2.0)
+            for b in set(_buckets(y)):
+                try:
+                    occ[b].remove(iv)
+                except ValueError:
+                    pass
+
+    def _fits(mm, d):
+        for (_, y, x, w) in mm:
+            lo, hi = x + d - w / 2.0, x + d + w / 2.0
+            for b in set(_buckets(y)):
+                for (a, c) in occ.get(b, ()):
+                    if lo - sib_gap < c and hi + sib_gap > a:
+                        return False
+        return True
+
+    for _, mm in placed:
+        _add(mm)
+
+    # ⚠️ 家族遍历**必须定序**：`{...}` 集合的迭代顺序随进程随机（str 哈希随机化），
+    #   而滑动是逐个进行的 ⇒ 顺序不同结果不同（实测同一档两次跑出两种框宽）。
+    for _k in sorted(by_fam):
+        cluster = by_fam[_k]
+        if len(cluster) < 2:
+            continue
+        anchor = min(cluster,
+                     key=lambda mm: min(x - w / 2.0 for (_, _, x, w) in mm))
+        a_x0 = min(x - w / 2.0 for (_, _, x, w) in anchor)
+        a_x1 = max(x + w / 2.0 for (_, _, x, w) in anchor)
+        a_y0 = min(y for (_, y, _, _) in anchor)
+        a_y1 = max(y for (_, y, _, _) in anchor) + card_h
+        for mm in cluster:
+            if mm is anchor:
+                continue
+            y0 = min(y for (_, y, _, _) in mm)
+            y1 = max(y for (_, y, _, _) in mm) + card_h
+            if y1 <= a_y0 or y0 >= a_y1:
+                continue                     # 不同代 ⇒ 不许插进家族中央
+            m_left = min(x - w / 2.0 for (_, _, x, w) in mm)
+            m_right = max(x + w / 2.0 for (_, _, x, w) in mm)
+            _clear(mm)
+            best = None
+            # 贴主体右沿（不够就往右退）／贴左沿（不够就往左退），取位移小的
+            for base, step in (((a_x1 + sib_gap) - m_left, 6.0),
+                               ((a_x0 - sib_gap) - m_right, -6.0)):
+                for i in range(700):
+                    d = base + step * i
+                    if abs(d - base) > 5000.0:
+                        break
+                    if _fits(mm, d):
+                        if best is None or abs(d) < abs(best):
+                            best = d
+                        break
+            if best is not None:
+                for i in range(len(mm)):
+                    nm, y, x, w = mm[i]
+                    mm[i] = (nm, y, x + best, w)
+            _add(mm)
+
+
 def _build_link_pairs(years: Dict[str, int], parent_of: Dict[str, str], lay: Layout):
     """只算连线的起止边，不算路径。
 
@@ -581,11 +966,17 @@ def _build_link_pairs(years: Dict[str, int], parent_of: Dict[str, str], lay: Lay
     """
     # 同父多子 → 阶梯式总线：横向段高度在「父卡下沿」与「最低那个子卡上沿」之间等分。
     # 只处理「子卡在父卡下方」的正常情形；生年倒挂的少数条用中点，不参与阶梯。
+    # ★ 2026-10-11（防再崩）：端点**没落位就跳过**。原来只判 `f not in years`，
+    #   而「有生年却因挂靠成环拿不到坐标」的人**在 years 里、却不在 positions 里**
+    #   ⇒ `KeyError` 一路冒到视图、被 try/except 吞掉 ⇒ **整块画布空白**。
+    #   任何一个算不出来的孤儿，都不该让整张时间家谱消失。
     ch = lay.card_h
+    attach = getattr(lay, "attach_side", {})
     kids: Dict[str, List[str]] = defaultdict(list)
     for n in years:
         f = parent_of.get(n, "")
-        if f not in years:
+        if f not in years or f not in lay.positions or n not in lay.positions \
+                or n in attach:
             continue
         fx, fy = lay.positions[f]
         cx, cy = lay.positions[n]
@@ -605,8 +996,9 @@ def _build_link_pairs(years: Dict[str, int], parent_of: Dict[str, str], lay: Lay
 
     for n in sorted(years, key=lambda x: (years[x], x)):
         f = parent_of.get(n, "")
-        if f not in years or f == n:
-            continue
+        if f not in years or f == n or n in attach \
+                or f not in lay.positions or n not in lay.positions:
+            continue                          # 挂靠只定位，不画血缘线；没落位不画
         fx, fy = lay.positions[f]
         cx, cy = lay.positions[n]
         # 起止边按「子卡在父卡哪一侧」定：正常连父下沿→子上沿；

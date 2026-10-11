@@ -202,6 +202,21 @@ def load_tables(src):
                     #   合法分），这里是第四处漏网：先到的表写入 0（真值），后表
                     #   的非零值会把它顶掉，违反「先来的优先」。0 从空集合去掉。
                     cur = by_code[c]
+                    # ★ 2026-10-11：族谱表里**同一个人并存两条记录** —— 一条给真父名
+                    #   （实测 3179 姬阖闾：`Father_Name='姬诸樊'`），一条给游戏「显示
+                    #   世代」占位父名（`Father_Name='姬阖闾父'`／`姬阖闾祖`…）。先到的
+                    #   若正好是占位那条，真父名就再也换不进来（下面只填"空"）。
+                    #   判据：**父/母名以 父/祖/曾/高 结尾 = 占位** ⇒ 让位给真名那条。
+                    if tbl == "族谱表":
+                        for _ck, _nk in (("Father_Code", "Father_Name"),
+                                         ("Mother_Code", "Mother_Name")):
+                            _op = str(cur.get(_nk) or "")
+                            _np = str(it.get(_nk) or "")
+                            if _np and not PLACEHOLDER_SUFFIX.search(_np) \
+                                    and PLACEHOLDER_SUFFIX.search(_op):
+                                cur[_nk] = _np
+                                if it.get(_ck):
+                                    cur[_ck] = it[_ck]
                     for k, v in it.items():
                         if k == "_tbl":
                             continue
@@ -209,6 +224,32 @@ def load_tables(src):
                         if old in (None, "", [], {}) and v not in (None, "", [], {}):
                             cur[k] = v
         print(f"    {tbl:<5s} {n:>5} 条")
+
+    # ★★ 2026-10-11 使用者报「xx父 设定成快 100 代」的**根**：族谱表里除了真父链，
+    #   游戏还并存一条「**显示世代**」占位链，形如
+    #     `3179 阖闾 → 父(3175, 名「阖闾父」) → 祖(3175祖) → 曾(3175曾) → 高(3175高)`
+    #   —— 编号是**纯数字**（不是 `100000150父` 那种带后缀的壳），名字却带 父/祖/曾/高
+    #   后缀、**没有生年**、人物表里**查无此人**。旧判据只看**编号**有没有后缀
+    #   （`_is_ph`），于是这批全躲过了 ⇒ 把它们当真祖先收进谱，还顶掉了同一编号的
+    #   真人（3175 真身是姬诸樊）。剔除后：名字改由**儿女的真父名**提供（见上一条
+    #   判据），世代由「按儿女回推」定 —— 实测 3175 得 82 代，与《秦末起义》一致 ✔。
+    _person_codes = {c for c, r in by_code.items() if r.get("_tbl") != "族谱表"}
+    # ⚠️ 保险：还要求「**去掉后缀的那个字**」等于表内**另一人的名**（`阖闾父`→`阖闾`
+    #   = 姬阖闾）—— 这才证明确实是从别人名字派生的显示占位。真名以祖结尾的
+    #   （`嫫祖`/`圭祖`，去后缀得 `嫫`/`圭`，表里没有这个人）**不会被误杀**。
+    _stems = {str(r.get("Ren_Ming") or "").strip() for r in by_code.values()}
+    _stems.discard("")
+    _drop = [c for c, r in by_code.items()
+             if r.get("_tbl") == "族谱表"
+             and PLACEHOLDER_SUFFIX.search(str(r.get("Ren_Ming") or ""))
+             and not str(r.get("Born_Time") or r.get("Ren_Chu_Sheng_Time") or "").strip()
+             and c not in _person_codes
+             and PLACEHOLDER_SUFFIX.sub("", str(r.get("Ren_Ming") or "")) in _stems]
+    for c in _drop:
+        del by_code[c]
+    if _drop:
+        print(f"    （族谱表「显示世代」占位记录 {len(_drop)} 条已剔除：名带父/祖/曾/高、"
+              f"无生年、人物表查无 ⇒ 不是真人）")
     return by_code
 
 
@@ -1374,67 +1415,53 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
     father_get = {c: resolve_parent(by_code[c])[0] for c in keep}
     mother_get = {c: resolve_parent(by_code[c])[1] for c in keep}
 
-    # ---- 2b. 孤立的非史实女性不入谱（2026-10-03 使用者裁定）----
-    #   原话：「如果是单人非史实的女角色，不要入谱」。
-    #   缘起：`prune == "all"`（C 全收口径）会把人物各表的**非史实女性一律**收进来，
-    #   其中一大批在谱里**一条边都没有** —— 女不载于族谱表（无父），又没嫁进/没在本谱
-    #   内生养，于是悬成一堆孤立节点（实测「秦末起义」431 人）。这类留之无用，剔掉。
-    #   判据：非史实 + 女性 + 在**谱内**无父、无母、无配偶，且不是任何人的父/母
-    #        （自身 `Ren_Zi_Nv_Code_Array` 也没有落在谱内的子女）。
+    # ---- 2b. 非史实「非亲」不入谱（★ 2026-10-03 使用者口径，取代原「孤立女性」条款）----
+    #   原话：「**非史实人物只有是史实人物后裔、或者被我关注的人物的后裔才入谱**」
+    #        +「**不要亲家**」。
+    #   缘起：`all`（全收）把人物各表几千个非史实路人一律灌进来 —— 实测本档
+    #   非史实 5540 人里，父编号**为空 2479、挂占位祖先 2141**，从全部史实沿父链
+    #   往下走只能捞到 200~320 个 ⇒ 其余的**接不回任何史实人物**，在谱里就是一堆
+    #   孤立岛屿（使用者原话：「没有用的孤立根节点太多了」）。
+    #   判据：
+    #     ① 从**全部史实**出发，**只沿「父」边下走**（纯父系本支；女儿作为叶子收下，
+    #        但**不往下牵**）；
+    #     ② 再补入两类「家人」且**不再从它们外延**：已保留者的**母亲**、
+    #        已保留**男性**的**配偶**（妻子）—— 这样妻子/母亲保得住，
+    #        而**岳父、女婿、外甥等亲家一概不进**。
+    #   ⚠️ 关注名单（books 侧）的支不在这里判 —— 抽取端只认史实；关注的那几支
+    #      由续谱合并时"谱内独有"自然保住。
     #   ⚠️ `hist` 等口径本来就不收非史实，无需再判，故只在 `all` 下生效。
-    #   ⚠️ 单趟判定即可：一个女性若育有谱内子女，她就落在 `_parents_in` 里 → 保留；
-    #      其子女的 `mother_get` 也指向她（在 keep 内）→ 子女也保留，不会连锁削人。
     if prune == "all":
-        _parents_in = {p for p in
-                       list(father_get.values()) + list(mother_get.values()) if p}
-        _lone = set()
+        _kids2 = defaultdict(list)
         for c in keep:
-            r = by_code[c]
-            if is_hist(c) or not is_female(r):
+            _f = father_get.get(c)
+            if _f and _f != c:
+                _kids2[_f].append(c)
+        _k2, _st = set(), [c for c in keep if is_hist(c)]
+        while _st:
+            _x = _st.pop()
+            if _x in _k2:
                 continue
-            if father_get.get(c) or mother_get.get(c) or c in _parents_in:
-                continue
-            if any(str(x) in keep for x in (r.get("Ren_Pei_Ou_Code_Array") or [])):
-                continue
-            if any(str(x) in keep for x in (r.get("Ren_Zi_Nv_Code_Array") or [])):
-                continue
-            _lone.add(c)
-        if _lone:
-            keep -= _lone
-            print(f"  剔除非史实孤立女性 {len(_lone)} 人（谱内无父/母/配偶/子女）")
+            _k2.add(_x)
+            _st.extend(_kids2.get(_x, ()))
+        _spine = len(_k2)
+        for c in list(_k2):                     # 补家人：快照列表 ⇒ 补进来的不再外延
+            _m = mother_get.get(c)
+            if _m:
+                _k2.add(_m)
+            if not is_female(by_code[c]):
+                for _s in (by_code[c].get("Ren_Pei_Ou_Code_Array") or []):
+                    _s = str(_s)
+                    if _s in keep and _s != c:
+                        _k2.add(_s)
+        _out = keep - _k2
+        if _out:
+            keep -= _out
+            print(f"  剔除非史实「非亲」{len(_out)} 人（父系本支 {_spine} 人之外，不含亲家）")
 
-    # ---- 3. 名字（氏+名；重名缀中文序数） ----
-    titles_all = load_titles(src)      # 重名排序要看有没有爵位，先读出来
-    base = {c: name_of(by_code[c]) for c in keep}
-    groups = defaultdict(list)
-    for c, n in base.items():
-        groups[n].append(c)
-
-    # 重名：名字后面**不加解释性后缀**，只缀一个中文序数（一/二/三…），
-    # 同时在传记里点明「同名者共几人、此为其几」。
-    # 存档结构是 {姓名: 记录}，同名会互相覆盖，所以必须靠这个序数区分开。
-    def _rank(c):
-        r = by_code[c]
-        jue = bool(pick_title(titles_all.get(name_of(r)),
-                              r.get("Ren_Generations")).get("jue"))
-        # 排首位的是「史实 → 有爵位 → 生年早」，它保留不带序数的原名
-        return (not is_hist(c), not jue, born_of(r) or 0, str(c))
-
-    final, bios_name, dup_info, dup_names = {}, {}, {}, 0
-    for n, cs in groups.items():
-        if len(cs) == 1:
-            final[cs[0]] = n
-            continue
-        dup_names += len(cs)
-        order = sorted(cs, key=_rank)
-        for i, c in enumerate(order):
-            # 都缀序数（风会胜1 / 风会胜2），只给后面几个缀会读成「第一个叫风会胜、
-            # 第二个叫风会胜1」，反而串了。传记开头用不带序数的本名。
-            # ★ 序数是**纯数字**（使用者 2026-09-22 要求），渲染层会把它缩成
-            #   小号灰字贴在名字最后一字的**右上角**（像幂）。
-            final[c] = n + dup_num(i + 1)
-            bios_name[c] = n
-            dup_info[c] = (i + 1, len(order))
+    # ---- 3. 宗庙爵位（`has_jue` 与重名排序都要用，先读出来） ----
+    #   ★ 名字分配本身已挪到**剪枝之后**（见下方 3b）—— 2026-10-06 改。
+    titles_all = load_titles(src)
 
     # ---- 4. 世代：始祖按出生年落桶，其余 = 父亲 + 1 ----
     anc = ancestor_codes(src)
@@ -1525,12 +1552,12 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
     #   ⚠️ 反查要**父母各查一次** —— 只查「父优先的那一个」会漏掉母亲这一侧
     #      （风少典的父是风伏羲，于是永远找不到女娲）。
     _syn_kids = {}
+    _kids_of = defaultdict(list)
+    for _c in keep:
+        for _p in (father_get.get(_c), mother_get.get(_c)):
+            if _p:
+                _kids_of[_p].append(_c)
     if _syn:
-        _kids_of = defaultdict(list)
-        for _c in keep:
-            for _p in (father_get.get(_c), mother_get.get(_c)):
-                if _p:
-                    _kids_of[_p].append(_c)
         _n = 0
         for _c in _syn:
             _kc = list(_kids_of.get(_c, []))
@@ -1542,6 +1569,33 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
                 _n += 1
         if _n:
             print(f"  补回的祖先按儿女回推世代 {_n} 人")
+
+    # ★★ 2026-10-11 使用者报「**xx父 设定成快 100 代**，吴国先祖跑到公元前 200 年」：
+    #   上面那条「按儿女回推」原来**只服务 `_syn`**（只被引用、无本人记录的祖先），
+    #   于是**族谱表里有记录、但没有生年、父链又断**的那批人被漏掉 —— 他们最后落进
+    #   「时代兜底」（本档开局年那一代）。实测《秦末宋兴》：`姬阖闾父`(3175) 无生年、
+    #   父是 `3175祖` 壳（不在 keep）⇒ 兜底成**第 97 代**；儿子 `姬阖闾` 有生年
+    #   （前 557）本该第 83 代，却因「入谱/续谱」按**父代 +1** 重算 ⇒ 98，孙子
+    #   `姬夫差` ⇒ 99 —— 整支春秋吴国先祖被搬到秦末那一层（约前 200 年）。
+    #   ⇒ 推广到**所有世代未定的人**：只要儿女已定代，父母 = min(儿女) − 1。
+    #   为什么对：儿女的代是**出生年落桶**得来的（比兜底可信），父母必然早一代。
+    #   实测同一编号 3175 在《秦末起义》里正是第 82 代（儿子 83 − 1）✔。
+    _back = 0
+    for _round in range(12):
+        _ch = False
+        for _c in keep:
+            if _c in gen:
+                continue
+            _ks = [gen[_k] for _k in _kids_of.get(_c, ()) if _k in gen]
+            if _ks:
+                gen[_c] = max(1, min(_ks) - 1)
+                gen_src[_c] = "按儿女回推"
+                _ch = True
+                _back += 1
+        if not _ch:
+            break
+    if _back:
+        print(f"  世代未定者按儿女回推 {_back} 人（推广自 _syn 版，2026-10-11）")
 
     unresolved = [c for c in keep if c not in gen]
     print(f"  世代：① 父子链 {chained} 人 · ② 出生年 {fallback} 人 · "
@@ -1681,6 +1735,47 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
         if back:
             keep |= back
             print(f"  续谱名单不参与剪枝：把 {len(back)} 人放回名单")
+
+    # ---- 3b. 名字（氏+名；重名缀数字序号）★ 2026-10-06 从剪枝前挪到这里 ----
+    #   使用者裁定：「重名则加数字序号，参考已经有的重名机制」。
+    #   本段原来在剪枝**之前**跑，用的是剪枝前的 `keep` ⇒ 那些**随后会被剪掉**的
+    #   同名者照样占住了不带序数的原名，逼得留下来的史实改叫「X1」。
+    #   实测（Save_All_104）：新档里有两个「嬴绾」——史实 12276（男，-314～-285）
+    #   与非史实 100004286（女，-204 生）；hist 口径把非史实剪掉后，留下来的
+    #   史实却被命成「嬴绾1」，续谱还把它写进谱牒（报告里「改名 1 人」就是它）。
+    #   ⇒ 现在用**剪枝后的 keep** 重新分组，史实就占回了原名。
+    base = {c: name_of(by_code[c]) for c in keep}
+    groups = defaultdict(list)
+    for c, n in base.items():
+        groups[n].append(c)
+
+    # 重名：名字后面**不加解释性后缀**，只缀一个数字序号，同时在传记里点明
+    # 「同名者共几人、此为其几」。存档结构是 {姓名: 记录}，同名会互相覆盖，
+    # 所以必须靠这个序号区分开。
+    def _rank(c):
+        r = by_code[c]
+        jue = bool(pick_title(titles_all.get(name_of(r)),
+                              r.get("Ren_Generations")).get("jue"))
+        # 排首位的是「史实 → 有爵位 → 生年早」，它保留不带序数的原名
+        return (not is_hist(c), not jue, born_of(r) or 0, str(c))
+
+    final, bios_name, dup_info, dup_names = {}, {}, {}, 0
+    for n, cs in groups.items():
+        if len(cs) == 1:
+            final[cs[0]] = n
+            continue
+        dup_names += len(cs)
+        order = sorted(cs, key=_rank)
+        for i, c in enumerate(order):
+            # 都缀序号（风会胜1 / 风会胜2），只给后面几个缀会读成「第一个叫风会胜、
+            # 第二个叫风会胜1」，反而串了。传记开头用不带序数的本名。
+            # ★ 序号是**纯数字**（使用者 2026-09-22 要求），渲染层会把它缩成
+            #   小号灰字贴在名字最后一字的**右上角**（像幂）。
+            final[c] = n + dup_num(i + 1)
+            bios_name[c] = n
+            dup_info[c] = (i + 1, len(order))
+    if dup_names:
+        print(f"  重名缀序号 {dup_names} 人")
 
     # ---- 4b. 补父子连线 ----
     # 上一轮剪枝 + 剔除占位祖先后，有些人的父辈不在最终名单里了 ——
@@ -1901,7 +1996,13 @@ def build(src, seeds=None, prune="none", real_state=False, history=True,
         r = by_code[c]
         nm = final[c]
         if nm in people:
-            nm += "#2"
+            # 重名兜底也走**数字序号**（与 3b 的 final 同一套，见 `dup_num`）——
+            # ★ 2026-10-06 统一：原来这里是 ASCII 的 `#2`，与名字里的「风会胜1」
+            #   风格不一致，画布上的角标渲染也认不出它。
+            _i = 1
+            while nm in people:
+                _i += 1
+                nm = final[c] + dup_num(_i)
         shi = (r.get("Ren_Shi") or r.get("Ren_Xing") or "").strip()
         fa, mo = father_get[c], mother_get[c]
         # 父/母必须在最终名单里才写名字。上溯找不到在册祖先时 father_get 仍指着一个
@@ -2734,9 +2835,10 @@ def merge_into(old_raw, fresh_people, gen_src=None, meta=None):
             continue
         # 旧档独有 → 原样保留，一个字段都不动
         # （占位祖先空壳在上面第 1 步就已经剔掉了，走不到这里）
-        key = on
+        key, _i = on, 1
         while key in people:
-            key += "#2"
+            _i += 1
+            key = on + dup_num(_i)      # 数字序号（与 3b 同一套）★ 2026-10-06
             report["collision"] += 1
         people[key] = dict(old[on])
         final_name[on] = key
@@ -2854,7 +2956,7 @@ def format_report(report, meta=None, dry_run=True):
              f"母 {report['rel_mother']} · 配偶 {report['rel_spouse']}"
              f"（血缘沿用旧值 {report['kin_kept']} 条）")
     if report["collision"]:
-        L.append(f"  重名冲突另存 {report['collision']} 人（缀 #2）")
+        L.append(f"  重名冲突另存 {report['collision']} 人（缀数字序号）")
     if report["dangling_spouse"]:
         L.append(f"  配偶指向谱外被移除 {len(report['dangling_spouse'])} 条")
     if report["dangling_father"]:

@@ -205,11 +205,21 @@ def game_year(slot) -> Optional[int]:
       则不存在」）。要做到随开局时间动态变化，就得先问存档：你走到哪年了。
 
     存档里的时间字段是 `年,月,?` 这种逗号串（实测 `-209,1,0`），
-    表名各版本不一样，所以按可靠度依次试几张「一开局就该有记录」的表。
+    表名各版本不一样，所以**扫这几张表、取最大的年份**（见下方 2026-10-06 的修）。
     都取不到就返回 None —— 调用方退回「最晚生年 + 余量」。
+
+    ★ 2026-10-06 修（使用者报「都玩到 -204 年了，-203 年死的人还写余寿 4 年」）：
+      原实现按**表序**依次试，撞上第一张有记录的表就把**第一条**的年 return 掉。
+      实测 `Save_All_4`：`Save_Zhan_Zheng_Data.Start_Time` 只有 2 行（近两次战争，
+      first=-207 / max=-206）⇒ 返回 **-207**；而真实当前年是 **-204**
+      （外交 / 会访 / 名分三张互相独立的表，各自的最大年都是 -204）。
+      `NOW_YEAR` 少 3 年 ⇒ `Profile.yushou`（余寿）整整多算 3 年 —— 就是那条报障。
+      ⇒ 改为**扫全部候选表取最大年**：最大的年份 = 最接近「现在」，
+        且多张表互相印证，单张表里的旧记录再也带不偏结果。
     """
     if slot is None:
         return None
+    best = None
     for fam, key in (("Save_Zhan_Zheng_Data", "Start_Time"),
                      ("Save_Wai_Jiao_Data", "War_Creat_Time"),
                      ("Save_Hui_Fang_Data", "Record_Time"),
@@ -228,9 +238,9 @@ def game_year(slot) -> Optional[int]:
                 y = int(head)
             except ValueError:
                 continue
-            if -4000 <= y <= 2000:
-                return y
-    return None
+            if -4000 <= y <= 2000 and (best is None or y > best):
+                best = y
+    return best
 
 
 def is_slot_dir(path: str) -> bool:

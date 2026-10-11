@@ -75,11 +75,22 @@ FAMILIES = OrderedDict([
     ("Save_KingData/Dian_Ce_Array",          ("国家 · 典册", "国家")),
     ("Save_KingData/Guo_Jun_Zun_Hao_List",   ("国家 · 国君尊号", "国家")),
     ("Save_KingData/Zhan_Zheng_Array",       ("国家 · 战争", "国家")),
+    # ★ 2026-10-04 补登记（此前导航上裸显英文键 +「（未登记）」）：
+    ("Bie_Bu_Manager/Bie_Bu_Map",            ("别部 · 编制", "军事")),
+    ("Shi_Zu_Controller/Shi_Zu_Arr",         ("世族 · 宗谱", "国家")),
+    ("Shi_Men_Controller/Shi_Men_Arr",       ("世门 · 名录", "国家")),
+    ("Shi_Men_Controller/Shi_Men_Guan_Xi_Arr", ("世门 · 师承", "国家")),
+    ("Save_Shu_Ju_Chi_Data/Qiu_Xue_Jie_Shu_Map", ("求学 · 结业", "文化")),
+    ("Save_ED_Ren_Data",                     ("人物 · 旧档", "人物")),
     ("Zong_Miao_Controller/All_King_Zong_Miao_Array",
      ("宗庙 · 各国宗庙", "国家")),
     ("Zong_Miao_Controller/All_Memorial_Array",
      ("宗庙 · 祭祀牌位", "国家")),
     ("Zong_Miao_Controller/All_Miao_Array",  ("宗庙 · 庙主", "国家")),
+    # ★ 2026-10-03：神明本体（46 位）不在存档的表族里，埋在 `Save_Controller_Data`
+    #   的嵌套 `Gods_Arr` / `Gods_Sys_Arr` 中 —— 由 `app/gods.attach_table()`
+    #   摊平成派生表挂上来（照《全史存档》「人物 · 谱牒总谱」的做法）。
+    ("神明 · 总表",              ("神明 · 总表", "国家")),
     # ---- 城池 ----
     ("New_Save_Map_Data",        ("城池 · 总表", "城池")),
     ("New_Save_Jin_Liu_Array",   ("进度流", "城池")),
@@ -104,12 +115,16 @@ FAMILIES = OrderedDict([
     ("Jia_Zu_Zhai_Yuan_Manager", ("家族 · 宅院", "家族")),
     ("Jia_Zu_Jian_Yu_Manager",   ("家族 · 监狱", "家族")),
     ("Save_Jia_Zu_And_Shan_Zhai_Guan_Xi", ("家族 · 山寨关系", "家族")),
-    ("Save_Jia_Zu_Shi_Guan",     ("家族 · 世官", "家族")),
-    ("Save_Jia_Zu_Shi_Guan/Jia_Zu_Data_Array", ("家族 · 世官数据", "家族")),
+    # ★ 2026-10-03 改名（使用者：「世官应该是史书吧，记载的都是历史」）——
+    #   查实：`Save_Shi_Guan.Text_Array` 与 `Save_Jia_Zu_Shi_Guan.Jia_Zu_Data_Array[].Str`
+    #   装的都是**编年大事记**（如「公元前200年2月，姚遏于秦咸阳组建妫姓姚氏家族」），
+    #   故一律按「史书」叫。字段名 `Shi_Guan`（世官）是游戏自己的命名，保留在悬停里。
+    ("Save_Jia_Zu_Shi_Guan",     ("家族 · 史书", "家族")),
+    ("Save_Jia_Zu_Shi_Guan/Jia_Zu_Data_Array", ("家族 · 史书记事", "家族")),
     ("Save_Jia_Zu_Shi_Guan/Qu_Yu_Code_Text_Map", ("家族 · 区域映射", "家族")),
-    ("Save_Shi_Guan",            ("世官", "家族")),
-    ("Save_Shi_Guan/King_Code_Text_Map", ("世官 · 国编号映射", "家族")),
-    ("Save_Shi_Guan_Total",      ("世官 · 总计", "家族")),
+    ("Save_Shi_Guan",            ("史书", "家族")),
+    ("Save_Shi_Guan/King_Code_Text_Map", ("史书 · 国编号映射", "家族")),
+    ("Save_Shi_Guan_Total",      ("史书 · 国名表", "家族")),
     ("Gong_Qing_Controller/Gong_Lao_Bu_Map", ("公卿 · 功劳簿映射", "家族")),
     ("Jia_Zu_Zhai_Yuan_Manager/Jia_Zhai_Data", ("家族 · 家宅", "家族")),
     # 家族子表
@@ -215,6 +230,9 @@ FAMILY_NOTE = {
     #   （始祖庙 level 0、高祖庙…），`Miao_Theme` 是主题码。
     #   与「神系 / 造神」相关的字段说明见世界页工具栏「字段说明」。
     "Zong_Miao_Controller/All_Miao_Array": "全庙表 —— 宗庙内的分级祭祀单位（始祖庙 / 高祖庙…），带 `Miao_Level` 庙等级。",
+    "神明 · 总表": "派生表：把 Save_Controller_Data 里的 Gods_Arr 摊平 —— 五系 46 位神，"
+                "一位一行。神格 / 威能两列已把 sg / wn 码译成中文，"
+                "未收复的码原样保留（宁缺勿猜）。",
     "Save_Wang_Chao_Data": "王朝本体：制度（中央集权制 / 宗法分封制）、阶段、德运，以及各项改革开关。",
     "Gong_Qing_Controller": "公卿功勋 / 过错簿 —— 功勋越高，罢免代价越大。",
     "Shi_Men_Controller": "世门（门第）—— 家族的门第高低。",
@@ -232,7 +250,9 @@ FAMILY_NOTE = {
     "Jia_Zu_Controller": "家族总表（宗室 / 卿室 / 公室）。",
     "Jia_Zu_Genealogy": "家族族谱 —— **游戏自己带的**，与我们可编辑的「谱牒层」不是一回事。",
     "Jia_Zu_Controller/Jia_Zu_Guan_Xi_Map": "家族两两之间的关系（同姓 / 姻亲）。",
-    "Save_Jia_Zu_Shi_Guan": "家族世官 —— 某家族世袭某官。",
+    "Save_Jia_Zu_Shi_Guan": "家族史书 —— 各家族的编年记事（正文含 `<color>` 富文本，显示时已剥离）。",
+    "Save_Shi_Guan": "史书 —— 全国编年大事记（正文含 `<color>` 富文本，显示时已剥离）。",
+    "Save_Shi_Guan_Total": "史书 · 国名表 —— 序号 → 国名。",
     # ---- 外交
     "Save_Wai_Jiao_Data": "两国一条：好感度(0~200) / 状态(中立·同盟·敌对) / 联姻 / 世仇 / 谍报进度。",
     "Save_Hui_Meng_Data": "会盟（多边盟约：睦邻友好 / 灾害互助 / 情报共享 / 文化认同…）。",
@@ -309,8 +329,15 @@ COLUMNS = {
                            ("Ren_End_Time", 110, False), ("Ren_Old", 50, True),
                            ("Ren_Wen_Hua", 60, False), ("Ren_Xing_Ge", 50, False),
                            ("Ren_Dai_Shu", 52, True)],
+    # ★ 2026-10-06 大修（使用者定案，两轮）：
+    #   · 去掉 `King_Str`（「游戏世系」那串原始文本）—— 表格不显示世系，
+    #     详情卡里叫「游戏世系」并**逐行**显示君主/谥号/在位年；
+    #   · 曾加过「先任君主」派生列，**已按使用者要求撤掉** ——
+    #     实测 137 国里只有秦国发生过易代，其余 136 国都是首任建国 ⇒
+    #     整列 136 个「缺」，白占 86px。先任君主在详情卡的「游戏世系」里
+    #     倒数第二行就是，不必单独占一列。
     "Save_KingData": [("King_Code", 60, True), ("King_Name", 80, False),
-                      ("King_Str", 110, False), ("King_Jue_Wei_Code", 66, True),
+                      ("King_Jue_Wei_Code", 66, True),
                       ("King_Bing_Li_Total", 76, True), ("King_Lao_Yi_Total", 76, True),
                       ("King_Tian_Ming", 66, True), ("King_Zheng_Tong", 66, True),
                       ("Guo_Xing", 60, False), ("Jian_Guo_Year", 76, True),
@@ -336,6 +363,13 @@ COLUMNS = {
          ("Ren_Shi", 56, False), ("Ren_Ming", 60, False), ("Born_Time", 100, False),
          ("Dead_Time", 100, False), ("Father_Name", 90, False),
          ("Mother_Name", 76, False), ("Generations", 60, True)],
+    # ★ 2026-10-03 新增：神明总表（派生表，列名本身就是中文，见 app/gods.py）。
+    #   只列「一眼要看的」：哪一系、哪一位、什么位阶、什么神格、有什么威能。
+    #   其余（位格 / 族域 / 始王 / 后裔族姓 / 神格码 / 威能码 / 编号 / 威能效果）
+    #   全部进右侧详情卡 —— 效果原文太长，塞进表格会撑爆。
+    "神明 · 总表": [("神系", 64, False), ("神名", 76, False), ("位阶", 64, False),
+                    ("神格", 80, False), ("威能", 252, False),
+                    ("威能上限", 64, True), ("族域", 56, False)],
     "Save_Wai_Jiao_Data": [("Wai_Jiao_Code_1", 78, True), ("Wai_Jiao_Code_2", 78, True),
                            ("Wai_Jiao_Guan_Xi", 76, True),
                            ("Wai_Jiao_Zhuang_Tai", 76, False),

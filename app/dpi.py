@@ -44,6 +44,9 @@ def init():
     # PER_MONITOR_AWARE_V2 → PER_MONITOR_AWARE → SYSTEM_AWARE → 旧默认。
     # Tk 8.6 处理不了 WM_DPICHANGED（跨屏改缩放不会重排），单窗口桌面程序
     # 用 SYSTEM 级最稳：主屏锐利、拖到异缩放屏由 Windows 位图缩放（旧行为）。
+    # ⚠️ 2026-10-06：曾把这里改成 context API 的 PMv2（想治「屏幕左上角白块」），
+    #   实测**无效** —— 真因是 app/offscreen.py 的影子画布（常驻映射的纯白无边框
+    #   窗）在主窗口最小化时被 max(...,0) 钳到屏幕原点，已在那边修掉。此处维持原样。
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:

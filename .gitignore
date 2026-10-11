@@ -11,6 +11,10 @@ staging/
 _scratch/
 _stats/
 _backup_*/
+# ★ 2026-10-04：`_backup_*` 统一收进 `_备份快照/`（使用者：「就不能放到一个文件夹吗」）。
+#   ⚠️ 改了名就不匹配上面的 `_backup_*/` 了 ⇒ **必须在这里再忽略一次**，
+#      否则 47.8 MB 快照会进 git 视野（第一版搬完差点踩中）。
+_备份快照/
 
 # ══ 导出产物（大二进制，不入库）══
 导出/
@@ -31,6 +35,7 @@ pad-android/local.properties
 
 # ══ 快捷方式 / 临时 / 系统 ══
 *.lnk
+*.bak_*
 *.tmp
 *.tmp_*
 _shiguan_slots.json

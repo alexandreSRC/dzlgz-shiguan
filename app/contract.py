@@ -33,14 +33,19 @@ BASE_DIR = _base_dir()
 RESOURCE_DIR = BASE_DIR
 
 # 实录槽默认搜索根（与阅览器一致：模拟器导出目录）
+# ★ 2026-10-05 便携包：加了两个**跟随 exe** 的搜索根 —— 把 Save_All_N 目录
+#   直接放 exe 旁边（或 exe 旁 records/ 里），新电脑上不依赖 __SHIGUAN_CACHE_ROOT__
+#   也能读到全部实录槽；原有两个绝对根保留（老机器行为不变）。
 RECORD_BASES = [
+    os.path.join(BASE_DIR, "records"),
+    BASE_DIR,
     r"__SHIGUAN_CACHE__",
     r"__SHIGUAN_CACHE_ROOT__",
 ]
 
 
 APP_NAME = "大周列国志 · 史馆"
-APP_VER = "2.0"
+APP_VER = "3.0"
 WINDOW_SIZE = "1440x860"
 WINDOW_TITLE = f"{APP_NAME} {APP_VER}"
 

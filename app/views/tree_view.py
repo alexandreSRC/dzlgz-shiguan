@@ -14,6 +14,7 @@ Tkinter 的 create_text 绝不传 width（否则竖排会被折成两列）。
 import logging
 import tkinter as tk
 import os
+import time
 import tkinter.font as tkfont
 
 from .. import bio as bio_mod
@@ -21,11 +22,12 @@ from .. import jue
 from .. import layout as L
 from .. import model
 from ..labels import split_dup
-from ..theme import TIER_DECOR, get_node_style
+from ..theme import TIER_DECOR, TIER_TOP, get_node_style, lighten
 # 中文避头尾折行、小传卡的拼装都抽到 app/widgets/popcard.py 了 —— 时间轴视图要用同一套
 from ..widgets.popcard import build_popcard
 from ..widgets.kit import est_text_px
 from .. import dpi as _dpi
+from ..offscreen import TileRingMixin
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,7 @@ def _round_rect(canvas, x1, y1, x2, y2, r, **kw):
 # 中文避头尾折行、小传卡的拼装都抽到 app/widgets/popcard.py 了 —— 时间轴视图要用同一套
 
 
-class TreeView:
+class TreeView(TileRingMixin):
     def __init__(self, parent, theme, master):
         """parent: 容器 Frame; master: App 控制器（提供 people / root / 回调）。"""
         self.master = master
@@ -83,6 +85,12 @@ class TreeView:
         self.canvas = tk.Canvas(outer, bg=theme.bg_canvas, highlightthickness=0,
                                 bd=0, cursor="hand2")
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # ★ 2026-10-04 使用者：画布**右上角固定**显示「爵位颜色注」（拖动不变）。
+        #   用 `place` 的子控件而非画布图元 —— 见 kit.tier_legend 的说明。
+        from ..widgets.kit import tier_legend
+        # ★ 2026-10-05 图例挂到**容器**上、`in_` 对齐画布 —— 挂在画布上会被
+        #   PrintWindow 拍进拖动快照，拖动时鬼影图例滑到画布中间（使用者实测）。
+        self._legend = tier_legend(self.canvas.master, theme, in_=self.canvas)
 
         self._vbar = tk.Scrollbar(outer, orient=tk.VERTICAL, command=self.canvas.yview,
                                   bg=theme.border_2, troughcolor=theme.bg_panel,
@@ -100,7 +108,7 @@ class TreeView:
                                   bd=0, relief=tk.FLAT)
         self.canvas.configure(xscrollcommand=self._on_xscroll)
         self._hbar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.canvas.bind("<Configure>", lambda _e: self._schedule_paint(), add="+")
+        self.canvas.bind("<Configure>", self._on_configure, add="+")
 
         self.lay = None
         self.person_rect = {}
@@ -114,6 +122,10 @@ class TreeView:
         self._line_factor_cache = {}
         self._state_boxes = []
         self._qing_boxes = []
+        # ★ 2026-10-06：框标题的**待画数据**（cx/ty/tw/th/色/文字/字号）。
+        #   框与标题原来只在 `_draw()` 里 create_* 一次，T2 分帧补画
+        #   （`delete("all")` 后只补人物）会把它们弄丢 ⇒ 单独缓存、可重画。
+        self._frame_titles = []
         # ★ 2026-09-26 按需绘制（启动优化 + 修「拖动不补」）：
         #   画布上**只留「视口 ± 半屏」里的人**（含其连线）——滚出去就删、滚进来就补。
         #   不再追求"把 13,526 人全画完"：全量绘制在真窗口要几十秒（79k item），
@@ -130,11 +142,100 @@ class TreeView:
         self._children_index = {}
         self._guess_rev = {}
         self._assoc_rev = {}
+        # ★★ 2026-10-04 T2（与时间轴同一套，实测数据见项目日志续五十二）：
+        #   Tk Canvas 滚动无位图优化，每次平移 = 全视口从头重画（代际实测
+        #   96ms/步、补画拍 800 卡时 850ms+）⇒ 拖动/滚动走「快照贴图」
+        #   （1 张视口位图，每步 ≈15ms），停止后分帧渐进补画真 items。
+        self._grab_id = None          # 快照 image item id（None = 非快照模式）
+        self._grab_photo = None       # ImageTk.PhotoImage（防 GC）
+        self._grab_release_job = None # 快照自动恢复定时器（滚轮/滚动条用）
+        self._grab_dragging = False   # 按住拖动中（停顿不拆快照 —— 防闪现）
+        self._grab_busy = False       # 快照抓图中（防 update/重入踩踏）
+        self._grab_underlay = None    # 松手后的垫底快照图 item id（补画完才删）
+        self._grab_underlay_photo = None
+        self._paint_steps = None      # 分帧补画步骤队列
+        self._tiles_init()            # 拖动底图瓦片（离屏预渲染环）
+        self._press = (0, 0, 0.0, 0.0)
+        # ★ 2026-10-11：手势中「上一次拖动后的视口位置」——scan 锚失效看门狗用
+        #   （见 `_on_drag`）。None = 当前没有按住拖动的手势。
+        self._drag_view = None
 
         self.canvas.bind("<ButtonPress-1>", self._on_click)
         self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<ButtonPress-3>", self._on_right_click)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
+        # ★ 2026-10-03：画布内**图元级悬停**（夫妻心出名字 / 母子虚线变红实线）。
+        self.canvas.bind("<Motion>", self._on_hover, add="+")
+        self.canvas.bind("<Leave>", lambda _e: self._clear_hover(), add="+")
+        self._hover_item = None       # 当前高亮/带提示的 canvas item
+        self._hover_tip = None        # 浮动的姓名提示 Label（画布内 place）
+        self._hover_orig = None       # 虚线被高亮前的（色, 虚线, 粗细）
+
+    # ------------------------------------------------ 画布图元悬停
+    def _clear_hover(self):
+        """撤掉当前图元的高亮与姓名提示（幂等）。"""
+        c = self.canvas
+        if self._hover_item is not None:
+            try:
+                if self._hover_orig:                     # 虚线：还原色/虚/粗细
+                    f, d, wd = self._hover_orig
+                    c.itemconfigure(self._hover_item, fill=f, dash=d, width=wd)
+                elif "hlink" in c.gettags(self._hover_item):
+                    c.itemconfigure(self._hover_item, fill=self.theme.spouse)
+            except Exception:
+                pass
+        self._hover_orig = None
+        self._hover_item = None
+        if self._hover_tip is not None:
+            try:
+                self._hover_tip.destroy()
+            except Exception:
+                pass
+            self._hover_tip = None
+
+    def _on_hover(self, e):
+        """鼠标下的图元：`mlink`（母子虚线）⇒ **变红实线**；带 `tip:` ⇒ 出姓名。
+
+        ★ 使用者原话：「虚线不要悬停，在我鼠标移动到的时候，把虚线变红实线高亮」
+           「给心增加悬停，不要括号，只两人姓名即可」。
+        提示文本挂在 **tag** 上而不是记 item id —— 连线/符号是**分批整批删建**的
+        （滚出视口即 `delete(tag)`），item id 不稳定，tag 才活得下来。
+        """
+        c = self.canvas
+        cur = c.find_withtag("current")
+        item = cur[0] if cur else None
+        if item == self._hover_item:
+            if self._hover_tip is not None:              # 跟着鼠标走
+                self._hover_tip.place(x=e.x + 12, y=e.y + 14)
+            return
+        self._clear_hover()
+        if item is None:
+            return
+        self._hover_item = item
+        tags = c.gettags(item)
+        # 任何带 `dinfo:` 的虚线 ⇒ **变红、变实线、加粗**（离开再还原）
+        for t in tags:
+            if str(t).startswith("dinfo:"):
+                _p = str(t)[6:].split("|")
+                self._hover_orig = (_p[0],
+                                    tuple(int(x) for x in _p[1].split(",") if x != ""),
+                                    int(_p[2]))
+                c.itemconfigure(item, fill=self.theme.danger, dash=(),
+                                width=max(2, int(2.2 * self.scale)))
+                return
+        tip = ""
+        for t in tags:
+            if str(t).startswith("tip:"):
+                tip = str(t)[4:]
+                break
+        if tip:
+            lb = tk.Label(c, text=tip, bg=self.theme.bg_card, fg=self.theme.text,
+                          font=(self.theme.font_ui_fallback, self.theme.fs_body_sm),
+                          bd=0, padx=6, pady=2, highlightthickness=1,
+                          highlightbackground=self.theme.border)
+            lb.place(x=e.x + 12, y=e.y + 14)
+            self._hover_tip = lb
 
     # ================================================================ 渲染
     @property
@@ -163,11 +264,40 @@ class TreeView:
             out.add(pin)
         return out
 
+    def _family_of(self):
+        """`{成员: 家族键}` —— 孤儿挂靠要的家族归属（与家族框**同一份判据**）。
+
+        ★ 2026-10-06 新增（续六十五的**代际版**：时间轴那次没做代际，这里是补课）。
+          取不到（无实录槽 / 没有公卿家族）返回 None，调用方照旧单遍布局 ——
+          零收益也零成本。
+        """
+        try:
+            from app import gongqing as _GQ
+            _slot = getattr(self.master, "record_slot", None)
+            if _slot is None:
+                return None
+            _ppl = self.master.people
+            _lin = L._lineage_groups(
+                _ppl, getattr(self.lay, "positions", None) or {},
+                any(v.get("lineage_name") for v in _ppl.values()))
+            _fr = _GQ.frame_groups(_slot, _ppl, _lin) or None
+            if not _fr:
+                return None
+            # 顺手把框缓存暖上（`_draw` 里同一份判据，省一次 7.7ms 计算）
+            self._frame_cache = ((id(_ppl), len(_ppl)), _fr)
+            # ★ 2026-10-11：家族爵位（根节点排序用「同姓同氏聚合 + 组间按爵位」）
+            self._fam_ranks = _GQ.family_ranks(_slot, _fr)
+            return {m: f["key"] for f in _fr for m in f["members"]}
+        except Exception:
+            return None
+
     def rerender(self, skip_collision=False):
         """重算布局并整体重绘。"""
+        self._tiles_bump()                # 布局重算 = 内容换代，瓦片作废重铺
         m = self.master
-        self.lay = L.compute_layout(
-            m.people,
+        # ★ 2026-10-06：布局参数先收进 `kw` —— 孤儿挂靠要**算两遍**
+        #   （第一遍定位 → 取家族归属 → 第二遍带 `families` 重算），两遍必须同参。
+        kw = dict(
             scale=self.scale,
             hidden_non_historical=m.hidden_non_historical,
             cutoff_person=m.cutoff_person,
@@ -185,6 +315,15 @@ class TreeView:
             # ★ 2026-09-24 侧栏「隐藏非史」全局开关（勾上隐藏全部非史实人物）
             hide_nohist_all=getattr(m, "hide_nohist_all", False),
         )
+        self.lay = L.compute_layout(m.people, **kw)
+        _fam = self._family_of()
+        if _fam:
+            # ★ 2026-10-11：根节点排序要用家族爵位（同姓同氏聚合、组间按爵位）
+            _lay2 = L.compute_layout(m.people, families=_fam,
+                                     fam_ranks=getattr(self, "_fam_ranks", None),
+                                     **kw)
+            if getattr(_lay2, "attach_count", 0):
+                self.lay = _lay2
         self._draw()
         # ★ 2026-09-23 使用者要求「过滤后空白的画布都隐藏」：隐藏逝者 / 仅显所选
         #   后内容可能只剩一小块，视口里大半是空白画布 —— 内容不满一屏时自动
@@ -197,19 +336,11 @@ class TreeView:
                 new_scale = min(self.scale * k, BASE_SCALE * ZOOM_MAX)
                 if new_scale > self.scale * 1.02:
                     self.scale = new_scale
-                    self.lay = L.compute_layout(
-                        m.people,
-                        scale=self.scale,
-                        hidden_non_historical=m.hidden_non_historical,
-                        cutoff_person=m.cutoff_person,
-                        skip_collision=skip_collision,
-                        hide_dead=m.hide_dead,
-                        focus_list=m.focused if getattr(m, "focus_only", False) else None,
-                        pinned_list=self._pinned(),
-                        enrolled_list=(m.enrolled_set()
-                                       if getattr(m, "enrolled_only", True) else None),
-                        hide_nohist_all=getattr(m, "hide_nohist_all", False),
-                    )
+                    _kw2 = dict(kw, scale=self.scale)
+                    if _fam:
+                        _kw2["families"] = _fam    # 缩放重算也要保住挂靠
+                        _kw2["fam_ranks"] = getattr(self, "_fam_ranks", None)
+                    self.lay = L.compute_layout(m.people, **_kw2)
                     self._draw()
 
     def _box_title_cx(self, min_x, max_x, tw, ty, th, band_hit):
@@ -243,6 +374,35 @@ class TreeView:
                 return cx
         return None
 
+    def _draw_frames(self):
+        """把「家族框 + 框标题」画到画布上（**纯绘制**，可反复调用）。
+
+        ★ 2026-10-06 新增：原来的框/标题只在 `_draw()` 全量重绘时 create_* 一次，
+          而 T2 分帧补画（`_paint_step`：`delete("all")` 后只补人物卡与连线）
+          会把它们弄丢 ⇒ 一滚动 `boxframe` 恒为 0，使用者报「世系框没有了」。
+          现在数据（`_state_boxes` / `_qing_boxes` / `_frame_titles`）由 `_draw()`
+          算好，落笔只做 delete + create —— 补画收尾调一次即恢复，
+          成本只有几十个矩形/文字（不重算分组，不碰视口）。
+        """
+        c = self.canvas
+        theme = self.theme
+        c.delete("boxframe")
+        c.delete("boxtitle")
+        for min_x, min_y, max_x, max_y, color, _ in self._state_boxes:
+            c.create_rectangle(min_x, min_y, max_x, max_y, fill="", outline=color,
+                               width=int(2.8 * self.scale), dash=(12, 5),
+                               tags="boxframe")
+        for min_x, min_y, max_x, max_y, color, _ in self._qing_boxes:
+            c.create_rectangle(min_x, min_y, max_x, max_y, fill="", outline=color,
+                               width=int(1.5 * self.scale), dash=(2, 2),
+                               tags="boxframe")
+        for cx, ty, tw, th, color, title, fs in getattr(self, "_frame_titles", ()):
+            c.create_rectangle(cx - tw / 2, ty, cx + tw / 2, ty + th,
+                               fill=color, outline=color, tags="boxtitle")
+            c.create_text(cx, ty + th / 2, text=title,
+                          font=(theme.font_gen, int(fs)), fill="#ffffff",
+                          tags="boxtitle")
+
     def _draw(self):
         c = self.canvas
         c.delete("all")
@@ -262,19 +422,38 @@ class TreeView:
         nw = lay.name_width
 
         # 1) 世系虚线框
+        # ★ 2026-10-04：框改走**家族框**（公卿家族，`gongqing.frame_groups` 唯一判据）。
+        #   有实录槽时才算；没槽（纯谱牒/测试）退回老的世系框路径。
+        from app import gongqing as _GQ
+        _slot = getattr(self.master, "record_slot", None)
+        # ★★ 2026-10-04 **性能**：`_draw()` 在拖动/缩放时会被**每帧**调用，而
+        #   `_lineage_groups`（实测 **7.7ms**）+ `frame_groups` 是纯计算、与视口无关
+        #   ⇒ 每帧重跑必卡（使用者实测「左右拖卡、上下拖/缩放都卡」）。
+        #   ⇒ **按 (people 身份, 人数) 缓存**一次算好的家族分组，之后直接复用。
+        _ck = (id(people), len(people))
+        _cache = getattr(self, "_frame_cache", None)
+        if _cache is not None and _cache[0] == _ck:
+            _fr = _cache[1]
+        else:
+            _fr = None
+            if _slot is not None:
+                _lin = L._lineage_groups(
+                    people, lay.positions,
+                    any(v.get("lineage_name") for v in people.values()))
+                _fr = _GQ.frame_groups(_slot, people, _lin) or None
+            self._frame_cache = (_ck, _fr)
         self._state_boxes, self._qing_boxes = L.state_group_boxes(
-            people, lay, theme.tier, tier_of=self._tier_of)
+            people, lay, theme.tier, tier_of=self._tier_of,
+            # ⚠️ 用 `key`（家族编号）建字典 —— 标题**允许同名**（「秦刘氏」两家），
+            #    按标题建会吞掉一家。
+            groups=({f["key"]: f["members"] for f in _fr} if _fr else None),
+            titles=({f["key"]: f["title"] for f in _fr} if _fr else None))
         # ★ 2026-09-26 使用者：「虚接线跟 X 国世系的边框线区分得不是很明显」。
         #   方案（使用者当场同意）：**世系框 = 长划虚线 + 加粗**（"框"感），
         #   把"点线感"让给推定线（见下面 3b，点划线 + 两端圆点）。
-        for min_x, min_y, max_x, max_y, color, _ in self._state_boxes:
-            c.create_rectangle(min_x, min_y, max_x, max_y, fill="", outline=color,
-                               width=int(2.8 * self.scale), dash=(12, 5),
-                               tags="boxframe")
-        for min_x, min_y, max_x, max_y, color, _ in self._qing_boxes:
-            c.create_rectangle(min_x, min_y, max_x, max_y, fill="", outline=color,
-                               width=int(1.5 * self.scale), dash=(2, 2),
-                               tags="boxframe")
+        # ★ 2026-10-06：矩形**不在这里落笔**了 —— 统一交给 `_draw_frames()`，
+        #   这样 T2 分帧补画（会 `delete("all")`）能低成本把框补回来。
+        #   实测不这么做的后果：一滚动 `boxframe` 恒为 0，框永久消失。
         # 6) 框标题（★ 2026-09-26 移到这里与框同层）—— 原来在连线之后画，
         #    「标题压连线」；改分批绘制后靠 tag 分层维持这个次序（见 _draw_people）：
         #    link < node < boxtitle < searchhit < popcard。
@@ -321,11 +500,9 @@ class TreeView:
             cx = self._box_title_cx(min_x, max_x, tw, ty, _th, band_hit)
             if cx is None:
                 continue
-            c.create_rectangle(cx - tw / 2, ty, cx + tw / 2, ty + _th,
-                               fill=color, outline=color, tags="boxtitle")
-            c.create_text(cx, ty + _th / 2, text=title,
-                          font=(theme.font_gen, int(_fs)), fill="#ffffff",
-                          tags="boxtitle")
+            # ★ 2026-10-06：标题也**只算不画**（同框线）—— 存进 `_frame_titles`，
+            #   由 `_draw_frames()` 统一落笔，补画时才能一起补回来。
+            self._frame_titles.append((cx, ty, tw, _th, color, title, _fs))
         for min_x, min_y, max_x, _, color, title in self._qing_boxes:
             if not title:
                 continue
@@ -341,11 +518,11 @@ class TreeView:
             cx = self._box_title_cx(min_x, max_x, tw, ty, _th, band_hit)
             if cx is None:
                 continue
-            c.create_rectangle(cx - tw / 2, ty, cx + tw / 2, ty + _th,
-                               fill=color, outline=color, tags="boxtitle")
-            c.create_text(cx, ty + _th / 2, text=title,
-                          font=(theme.font_gen, int(_fs)), fill="#ffffff",
-                          tags="boxtitle")
+            # ★ 2026-10-06：标题也**只算不画**（同框线）—— 存进 `_frame_titles`，
+            #   由 `_draw_frames()` 统一落笔，补画时才能一起补回来。
+            self._frame_titles.append((cx, ty, tw, _th, color, title, _fs))
+
+        self._draw_frames()            # ★ 2026-10-06：框与标题统一在此落笔
 
         # 2) 代数标签
         # ★ 2026-09-28 代数标签改画到左侧**独立的代数条**（`self.ruler`）上 ——
@@ -468,10 +645,45 @@ class TreeView:
         node_h = lay.node_h
         pos = lay.positions
         drawn = self._drawn_links
+        # ★ 2026-10-06 孤儿挂靠**只定位、不画线**（与时间轴同规）——见 layout
+        #   `compute_layout` 的 families 段：挂靠不是血缘，画出来就是假父子。
+        _att = getattr(lay, "attach_side", {})
+        # ★ 2026-10-06 入赘孩子（姓随母、挂母边）：只画母线、不画父线
+        _uz = getattr(lay, "uz_kids", set())
         gfill = theme.text_3
         sp_line = theme.spouse_line or theme.spouse
         sel = self.selected
+        def _dinfo(fill, dash, width):
+            """把「原色 / 原虚线样式 / 原粗细」编成一个 tag，供悬停高亮后还原。
+
+            ★ 2026-10-03 使用者：「其他有虚线的地方，都按照此例」
+              ⇒ 所有虚线（母子线 / 跨树夫妻 U 型线 / 推定世系点划线）都能
+                悬停**变红实线**。不记在 `self` 上是因为连线**分批整批删建**
+                （滚出视口即 `delete(tag)`），item id 不稳定；tag 随图元走，最稳。
+            """
+            return "dinfo:%s|%s|%s" % (fill, ",".join(str(x) for x in dash), int(width))
+
         sym = int(15 * self.scale / _dpi.SCALE * 0.7)
+        # ★ 2026-10-03 使用者：「夫妻之间的这个红心为什么是上下两个？」
+        #   查实**一对夫妻被画了两次心**：①「挂靠心」（`associate_of`，画在两框中间偏下）
+        #   与 ②「跨树夫妻 U 型线」末尾的 ♥。U 型线才是夫妻的正式画法 ⇒
+        #   **有 U 线的夫妻不再画挂靠心**（一对一颗）。
+        u_pairs = set()
+        for _n in names:
+            for _s in ((people.get(_n) or {}).get("spouses") or []):
+                if _s in pos:
+                    u_pairs.add(frozenset((_n, _s)))
+        # 同一锚点下若有**多位**配偶（且都没有 U 线），心**横向错开** ——
+        # 按她在锚点配偶表里的位次排（`associate_rank`，见 attach_lone_wives）。
+        assoc_wives = {}
+        for _n in names:
+            _i = people.get(_n) or {}
+            _r = _i.get("associate_of", "")
+            if (_r and _i.get("associate_type") == "spouse" and _r in pos
+                    and frozenset((_n, _r)) not in u_pairs):
+                assoc_wives.setdefault(_r, []).append(_n)
+        for _r, _ws in assoc_wives.items():
+            _ws.sort(key=lambda w: ((people.get(w) or {}).get("associate_rank") or 0, w))
         for name in names:
             info = people.get(name) or {}
             if name not in pos:
@@ -483,20 +695,26 @@ class TreeView:
             #   删掉；否则会留下悬空线（另一端已不在画布上）。
             if not info.get("hide_parent_line"):
                 dad = info.get("father", "")
-                if dad in pos and ("f", dad, name) not in drawn:
+                if (dad in pos and name not in _att and name not in _uz
+                        and ("f", dad, name) not in drawn):
                     drawn.add(("f", dad, name))
                     x1, y1 = pos[dad]
                     c.create_line(x1, y1 + node_h / 2, x2, y2 - node_h / 2,
                                   fill=theme.tree_line, width=int(2 * self.scale),
                                   tags=("link", f"p_{name}", f"p_{dad}"))
                 mom = info.get("mother", "")
-                if mom in pos and ("m", mom, name) not in drawn:
+                if mom in pos and name not in _att and ("m", mom, name) not in drawn:
                     drawn.add(("m", mom, name))
                     x1, y1 = pos[mom]
+                    # ★ 2026-10-03 使用者：「**虚线不要悬停**，在我鼠标移动到的时候，
+                    #   把虚线**变红实线高亮**。」⇒ 打 `mlink` 标，由画布 `<Motion>`
+                    #   处理（不加任何文字提示）。
                     c.create_line(x1, y1 + node_h / 2, x2, y2 - node_h / 2,
                                   fill=theme.spouse, dash=(4, 2),
                                   width=int(1 * self.scale),
-                                  tags=("link", f"p_{name}", f"p_{mom}"))
+                                  tags=("link", "mlink",
+                                        _dinfo(theme.spouse, (4, 2), int(1 * self.scale)),
+                                        f"p_{name}", f"p_{mom}"))
             # ---- 推定世系（点划线 + 两端圆点；与选中相关时加字）----
             g = info.get("father_guess", "")
             if g and g in pos and ("g", g, name) not in drawn:
@@ -507,7 +725,10 @@ class TreeView:
                               fill=gfill,
                               width=max(2, int((2.2 if near else 1.8) * self.scale)),
                               dash=(7, 3, 1, 3),
-                              tags=("link", f"p_{name}", f"p_{g}"))
+                              tags=("link",
+                                    _dinfo(gfill, (7, 3, 1, 3),
+                                           max(2, int((2.2 if near else 1.8) * self.scale))),
+                                    f"p_{name}", f"p_{g}"))
                 r_dot = max(2, int(2.6 * self.scale))
                 for _px, _py in ((x1, y1 + node_h / 2), (x2, y2 - node_h / 2)):
                     c.create_oval(_px - r_dot, _py - r_dot, _px + r_dot, _py + r_dot,
@@ -520,22 +741,41 @@ class TreeView:
                                   fill=gfill,
                                   tags=("linktext", f"p_{name}", f"p_{g}"))
             # ---- 同代人符号（夫妻♥ / 朋友友）----
+            # ★ 2026-10-04：判重键统一用 frozenset —— 此前 "a"/"s" 两个前缀
+            #   互不认识，同对夫妻被两条路径各画一次 ⇒ 两个 ♥ 叠在一起。
             ref = info.get("associate_of", "")
-            atype = info.get("associate_type", "clan")
+            # ★★ 2026-10-11 使用者：「导出画布上**为什么没看到挂靠符号**？」
+            #   查出来是**屏幕这一行也错了**：`info.get("associate_type", "clan")`
+            #   在**字段不存在**时取到 "clan" ⇒ 整类挂靠被 `atype != "clan"` 吞掉。
+            #   而事实是：**只有**主程序/自动关注写的宗主族人挂靠才显式标 `"clan"`
+            #   （`main.py` 2620「算族人（不画 ♥）」），**`tools/guess_lineage.py`
+            #   的同代人挂靠压根不写这个字段** —— 而五十五批定的口径明写
+            #   「挂靠（同代人）→ 同排 + **「友」标**」。
+            #   ⇒ **缺字段/空串一律当「友」**（显式 clan 仍不画）。
+            atype = str(info.get("associate_type") or "friend")
+            _ck = frozenset((name, ref)) if ref else frozenset()
             if (atype != "clan" and ref and ref != name and ref in pos
-                    and ("a",) + tuple(sorted((name, ref))) not in drawn):
-                drawn.add(("a",) + tuple(sorted((name, ref))))
+                    and _ck not in drawn
+                    and _ck not in u_pairs):
+                drawn.add(_ck)
                 x1, y1 = pos[ref]
-                mid_x = (x1 + x2) / 2
+                _ws = assoc_wives.get(ref) or [name]
+                _k, _i = len(_ws), (_ws.index(name) if name in _ws else 0)
+                mid_x = (x1 + x2) / 2 + (_i - (_k - 1) / 2.0) * sym * 1.6
                 bottom_y = max(y1, y2) + node_h / 2 + 1 + sym / 2
                 text = "♥" if atype == "spouse" else "友"
                 color = theme.spouse if atype == "spouse" else theme.accent
+                # ★ 2026-10-03 使用者：「给心增加悬停，**不要括号，只两人姓名即可**」
+                #   —— 提示文本挂在 tag 上（批量绘制会整批删建，item id 不稳定），
+                #   由画布 `<Motion>` 读 `tip:` 前缀取用。
+                _tip = ("%s · %s" % (ref, name)) if atype == "spouse" else ""
                 c.create_text(mid_x, bottom_y, text=text,
                               font=(theme.font_name, sym, "bold"), fill=color,
-                              tags=("linktext", f"p_{name}", f"p_{ref}"))
+                              tags=("linktext", "hlink") + (("tip:" + _tip,) if _tip else ())
+                                   + (f"p_{name}", f"p_{ref}"))
             # ---- 跨树夫妻 U 型线（对称关系，判重）----
             for s in (info.get("spouses") or []):
-                key = ("s",) + tuple(sorted((name, s)))
+                key = frozenset((name, s))
                 if s in pos and key not in drawn:
                     drawn.add(key)
                     x1, y1 = pos[name]
@@ -546,12 +786,16 @@ class TreeView:
                                   fill=sp_line,
                                   width=max(1, int(1.5 * self.scale)),
                                   dash=(4, 2),
-                                  tags=("link", f"p_{name}", f"p_{s}"))
+                                  tags=("link",
+                                        _dinfo(sp_line, (4, 2),
+                                               max(1, int(1.5 * self.scale))),
+                                        f"p_{name}", f"p_{s}"))
                     c.create_text((x1 + x3) / 2, drop_y + 2 * self.scale, text="♥",
                                   font=(theme.font_name,
                                         int(15 * self.scale / _dpi.SCALE * 0.85), "bold"),
                                   fill=sp_line,
-                                  tags=("linktext", f"p_{name}", f"p_{s}"))
+                                  tags=("linktext", "hlink", "tip:%s · %s" % (name, s),
+                                        f"p_{name}", f"p_{s}"))
             # ---- 向下：子女连线（父/母/推定父 → 已在布局的子女）----
             # ★ 2026-09-26 修「父子不连线」（使用者截图：魏击/魏挚与魏罃/魏缓/
             #   魏长卿之间断线）：连线归「子」所有，父滚出视口被淘汰时
@@ -561,11 +805,13 @@ class TreeView:
             for child in self._children_index.get(name, ()):
                 if child not in pos or child == name:
                     continue
+                if child in _att:
+                    continue          # ★ 挂靠对不画线（见上 `_att`）
                 cinfo = people.get(child) or {}
                 if cinfo.get("hide_parent_line"):
                     continue
                 cx, cy = pos[child]
-                if cinfo.get("father") == name:
+                if cinfo.get("father") == name and child not in _uz:
                     key = ("f", name, child)
                     if key in drawn:
                         continue
@@ -617,10 +863,11 @@ class TreeView:
                     continue
                 dinfo = people.get(dep) or {}
                 ref2 = dinfo.get("associate_of", "")
-                atype2 = dinfo.get("associate_type", "clan")
+                # ★ 2026-10-11 同上一处：缺字段 = 同代人挂靠 ⇒ 画「友」
+                atype2 = str(dinfo.get("associate_type") or "friend")
                 if atype2 == "clan" or not ref2 or ref2 != name:
                     continue
-                key = ("a",) + tuple(sorted((name, dep)))
+                key = frozenset((name, dep))
                 if key in drawn:
                     continue
                 drawn.add(key)
@@ -653,23 +900,281 @@ class TreeView:
             except Exception:
                 pass
 
-    def _schedule_paint(self, delay=40):
-        """安排一次「按需绘制」重排（去抖）——滚动/拖动会连发，别每像素算一次。
+    # （旧版 40ms 单拍 `_schedule_paint`/`_run_paint` 已并入下方分帧版 —— T2）
 
-        ⚠️ `TreeView` 是**普通对象**（不是 tk 控件）—— 必须走 `canvas.after`；
-        踩过：写成 `self.after(...)` 直接 AttributeError，被兜底 except 吃掉，
-        结果永远不补画（实测一万多人一动不动）。
+    def _schedule_paint(self, delay=15):
+        """安排一次「分帧补画」—— 每帧预算 12ms，画不完下帧继续（T2）。
+
+        ★ 为什么分帧：本机全视口重画 ≈850ms（中文文字光栅化 ~2ms/块），
+        一拍画 800 卡的 dirty ≈ 全视口 ⇒ 落屏 850ms —— 这才是代际拖动卡的
+        真身。每帧只画一小批，dirty 小 ⇒ 每帧 <16ms，内容渐进浮现。
+        ⚠️ `TreeView` 是普通对象 —— 必须走 `canvas.after`（本项目经典坑）。
         """
         if getattr(self, "_paint_job", None) is not None:
             return
-        try:
-            self._paint_job = self.canvas.after(delay, self._run_paint)
-        except Exception:
-            self._paint_job = None
+        if getattr(self, "_grab_id", None) is not None:
+            return                            # 快照模式：真 items 不参与，松手再补
+        self._paint_job = self.canvas.after(delay, self._paint_step)
 
-    def _run_paint(self):
+    def _paint_step(self):
         self._paint_job = None
-        self._paint_viewport()
+        if getattr(self, "_grab_id", None) is not None:
+            # 快照模式：真 items 绝不画（残留的泵会在快照图上叠画卡片）
+            self._paint_steps = None
+            return
+        # ★ 队列「None 或跑尽的 []」都要重建 —— 残留 [] 会让补画永远空转
+        if not self._paint_steps:
+            self._paint_steps = self._build_paint_steps()
+            if not self._paint_steps:
+                self._draw_frames()           # ★ 框/标题补回来（2026-10-06）
+                self._drop_grab_underlay()    # 没活干也要把垫底图放掉
+                self._tile_enqueue_ring()     # 顺手排一圈瓦片预铺
+                self._tile_prefetch_soon()
+                return
+        t0 = time.perf_counter()
+        while self._paint_steps and time.perf_counter() - t0 < 0.012:
+            step = self._paint_steps.pop(0)
+            try:
+                step()
+            except Exception as e:
+                logger.warning("代际补画分帧步骤失败：%r", e)
+        if self._paint_steps:
+            self._paint_job = self.canvas.after(15, self._paint_step)
+        else:
+            self._paint_steps = None          # 干完清队（下次重新 build）
+            self._draw_frames()               # ★ 框/标题补回来（2026-10-06）
+            self._drop_grab_underlay()        # 真 items 补齐 —— 垫底图退役
+            self._tile_enqueue_ring()         # 空下来了 —— 预铺周边瓦片
+            self._tile_prefetch_soon()
+
+    def _build_paint_steps(self):
+        """把一次「视口补齐」拆成小步闭包队列（淘汰 → 补卡每6张 → 装饰）。"""
+        steps = []
+        if self.lay is None or not self.lay.positions:
+            return steps
+        c = self.canvas
+        pos = self.lay.positions
+        vx0, vy0, vx1, vy1 = self._viewport_rect()
+        pad_x, pad_y = (vx1 - vx0) * 0.5, (vy1 - vy0) * 0.5
+        x0, y0, x1, y1 = vx0 - pad_x, vy0 - pad_y, vx1 + pad_x, vy1 + pad_y
+
+        gone = [n for n in self._drawn_people if n not in pos
+                or not (x0 <= pos[n][0] <= x1 and y0 <= pos[n][1] <= y1)]
+
+        def _evict():
+            for n in gone:
+                try:
+                    c.delete(f"p_{n}")
+                except Exception:
+                    pass
+                self._drawn_people.discard(n)
+                self.person_rect.pop(n, None)
+        if gone:
+            gone_set = set(gone)
+            self._drawn_links = {k for k in self._drawn_links
+                                 if not (gone_set & set(k))}
+            steps.append(_evict)
+
+        todo = [n for n in pos
+                if x0 <= pos[n][0] <= x1 and y0 <= pos[n][1] <= y1
+                and n not in self._drawn_people]
+        if todo:
+            cx, cy = (vx0 + vx1) / 2.0, (vy0 + vy1) / 2.0
+            todo.sort(key=lambda n: abs(pos[n][0] - cx) + abs(pos[n][1] - cy))
+            for i in range(0, len(todo), 6):
+                batch = todo[i:i + 6]
+
+                def _cards(batch=batch):
+                    try:
+                        self._draw_people(batch)
+                    except Exception as e:
+                        # 某个人画不出来也不能拖垮整拍（跳过，下一拍还会遇到）
+                        logger.warning("按需绘制跳过一批：%r", e)
+                steps.append(_cards)
+
+        def _decor():
+            keep = {n for n in pos
+                    if x0 <= pos[n][0] <= x1 and y0 <= pos[n][1] <= y1}
+            if self.selected in keep:
+                try:
+                    self._mark_selected(self.selected, True)
+                except Exception:
+                    pass
+            if self.search_hits:
+                try:
+                    self._paint_hits()
+                except Exception:
+                    pass
+        steps.append(_decor)
+        return steps
+
+    def _on_configure(self, _event):
+        """窗口尺寸变化：先退出快照（快照尺寸已不符），再去抖分帧补画。"""
+        self._tiles_bump()                # 瓦片尺寸跟着视口走，全部作废
+        self._grab_end()
+        self._schedule_paint()
+
+    # ------------------------------------------------ 快照贴图（T2）
+    def _grab_start(self):
+        """进入快照模式：真 items 全部换成一张视口位图（拖动/滚动期间）。"""
+        if self._grab_id is not None or getattr(self, "_grab_busy", False):
+            return True
+        if self.lay is None or not self.lay.positions:
+            return True
+        self._grab_busy = True
+        try:
+            from .. import wincap
+            from PIL import Image, ImageTk
+            # 上一次补画泵若还在跑，先停 —— 否则真 items 会一张张叠画到
+            # 快照图上（拖动闪现根源之一）；松手后 _grab_end 会重新安排。
+            if getattr(self, "_paint_job", None) is not None:
+                try:
+                    self.canvas.after_cancel(self._paint_job)
+                except Exception:
+                    pass
+                self._paint_job = None
+            self._paint_steps = None
+            # 滚轮路径残留的自动恢复定时器（上一手势留下的）：不撤会在本次
+            # 拖动中途触发 _grab_end（图被拆 → 闪现/抖动）
+            if self._grab_release_job is not None:
+                try:
+                    self.canvas.after_cancel(self._grab_release_job)
+                except Exception:
+                    pass
+                self._grab_release_job = None
+            w, h, bgra = wincap.capture_widget_region(self.canvas)
+            img = Image.frombuffer("RGBA", (w, h), bgra, "raw", "BGRA").convert("RGB")
+            self._grab_photo = ImageTk.PhotoImage(img)
+            c = self.canvas
+            vx0, vy0 = c.canvasx(0), c.canvasy(0)
+            c.delete("all")
+            self._drop_grab_underlay()        # 旧垫底图已随 delete("all") 移除，清引用
+            self._drawn_people = set()
+            self._drawn_links = set()
+            self.person_rect = {}
+            # 瓦片环：预渲染的周边底图钉上（±1 屏内拖动 = 拖图不露纸底）
+            self._tile_attach(c, vx0, vy0,
+                              max(c.winfo_width(), 50), max(c.winfo_height(), 50))
+            self._grab_id = c.create_image(vx0, vy0, image=self._grab_photo,
+                                           anchor="nw", tags=("grab",))
+            return True
+        except Exception as e:
+            logger.warning("快照模式启动失败，走原路：%r", e)
+            self._grab_id = None
+            self._grab_photo = None
+            return False
+        finally:
+            self._grab_busy = False
+
+    def _grab_move(self):
+        """快照模式下视口变了 —— 快照图**不**跟挪（保持钉在抓取时的文档
+        坐标上），内容才能随拖动自然平移，超出快照的边缘露纸底，松手
+        分帧补全。
+
+        ★ 2026-10-05 修「幽灵菜单栏」时一并改：原实现每步把图重新钉到
+        新视口左上角，拖动全程画面静止；且当时贴的是整窗截图（GA_ROOT），
+        左半就是菜单栏的幽灵。
+        """
+        if self._grab_id is None:
+            return
+
+    def _grab_end(self):
+        """退出快照模式：图**不删**，转为垫底（underlay）→ 分帧补画真 items
+        画在垫底图上方（同坐标同样式，画上即重合，肉眼零变化），补画跑完
+        `_paint_step` 才删垫底图。
+
+        ★ 2026-10-05 修「拖动以后抖动」：原来松手即删图 → 画布先空后靠
+          瓦片式补画逐步拼回来（卡片 6 张/帧、格线/世系框/朝代带最后几帧
+          才出现）—— 整幅画面反复重组 ≈1 秒，看起来就是抖。垫底方案下
+          松手瞬间画面与拖动中完全一致，重组全程被垫底图盖住。
+        """
+        self._grab_dragging = False
+        if self._grab_release_job is not None:
+            try:
+                self.canvas.after_cancel(self._grab_release_job)
+            except Exception:
+                pass
+            self._grab_release_job = None
+        if self._grab_id is None:
+            return
+        self._grab_underlay = self._grab_id
+        self._grab_underlay_photo = self._grab_photo   # 转 ref 防 GC（图元还引用着）
+        self._grab_id = None
+        self._grab_photo = None
+        self.canvas.delete("tile")        # 瓦片图元撤下（照片留在缓存供下次拖动）
+        self._schedule_paint()
+
+    def _drop_grab_underlay(self):
+        """垫底图使命结束（补画跑尽/重新进快照）—— 删图清引用。"""
+        if getattr(self, "_grab_underlay", None) is not None:
+            try:
+                self.canvas.delete(self._grab_underlay)
+            except Exception:
+                pass
+        self._grab_underlay = None
+        self._grab_underlay_photo = None
+
+    def _grab_arm_auto(self, delay=300):
+        """滚轮/滚动条路径：停顿 delay 毫秒后自动退出快照模式。
+
+        ★ 按住拖动中**绝不**自动退出 —— `_on_yscroll/_on_xscroll` 会在
+          拖动的每次 yview/xview 变化里被连带触发，若照旧 arm，拖动停顿
+          超 300ms 就拆快照渐进重画、手一动又重抓（delete("all") → 贴图），
+          就是使用者看到的「拖动闪现」。
+        """
+        if getattr(self, "_grab_dragging", False):
+            return
+        if self._grab_release_job is not None:
+            try:
+                self.canvas.after_cancel(self._grab_release_job)
+            except Exception:
+                pass
+        self._grab_release_job = self.canvas.after(delay, self._grab_end)
+
+    # ------------------------------------------------ 拖动底图瓦片（TileRing 钩子）
+    def _tile_root(self):
+        return self.master.root
+
+    def _tile_grid(self):
+        """瓦片 = 半个视口（≈1000×550，单块 ≈70ms，预铺泵 25ms 一块无感）。"""
+        vw = max(self.canvas.winfo_width(), 50)
+        vh = max(self.canvas.winfo_height(), 50)
+        return max(vw // 2, 200), max(vh // 2, 200)
+
+    def _tile_region(self):
+        lay = self.lay
+        return (0, lay.scroll_y_start, lay.scroll_x, lay.scroll_y_end)
+
+    def _tile_paint(self, cv, x0, y0, tw, th):
+        """在影子画布上画一块瓦片 —— 临时「换台」：绘图代码全走 self.canvas，
+        账本（已画名单/连线判重/命中表/选中态）全部换成草稿，画完还原，
+        不污染主画布的记账。"""
+        if self.lay is None or not self.lay.positions:
+            return
+        saved = (self.canvas, self._drawn_people, self._drawn_links,
+                 self.person_rect, self.selected, self.search_hits,
+                 self._grab_id)
+        self.canvas = cv
+        self._drawn_people = set()
+        self._drawn_links = set()
+        self.person_rect = {}
+        self.selected = None              # 瓦片不烙选中高亮（高亮是交互层）
+        self.search_hits = []
+        self._grab_id = "tile"            # 哨兵：_schedule_paint 见它就退
+        try:
+            vw, vh = cv.winfo_width(), cv.winfo_height()
+            vx1, vy1 = x0 + vw, y0 + vh
+            pad_x, pad_y = vw * 0.5, vh * 0.5
+            xa, ya, xb, yb = x0 - pad_x, y0 - pad_y, vx1 + pad_x, vy1 + pad_y
+            pos = self.lay.positions
+            todo = [n for n, (x, y) in pos.items()
+                    if xa <= x <= xb and ya <= y <= yb]
+            for i in range(0, len(todo), 40):
+                self._draw_people(todo[i:i + 40])
+        finally:
+            (self.canvas, self._drawn_people, self._drawn_links,
+             self.person_rect, self.selected, self.search_hits,
+             self._grab_id) = saved
 
     def _on_yscroll(self, *args):
         self._vbar.set(*args)             # 原行为：滚动条滑块位置
@@ -679,11 +1184,19 @@ class TreeView:
             self.ruler.yview_moveto(args[0])
         except Exception:
             pass
-        self._schedule_paint()            # 视口变了 → 安排补画
+        if self._grab_id is not None or self._grab_start():
+            self._grab_move()             # T2：滚动条走快照贴图
+            self._grab_arm_auto()
+        else:
+            self._schedule_paint()        # 视口变了 → 安排补画
 
     def _on_xscroll(self, *args):
         self._hbar.set(*args)
-        self._schedule_paint()
+        if self._grab_id is not None or self._grab_start():
+            self._grab_move()
+            self._grab_arm_auto()
+        else:
+            self._schedule_paint()
 
     def _paint_viewport(self):
         """按需绘制：画布上**只留「视口 ± 半屏」里的人**（连同他们的连线）。
@@ -889,14 +1402,37 @@ class TreeView:
             dead = bool(info.get("death")) and not _st2.hide_dead_shade(
                 getattr(self.master, "current_save", ""))
             rect = c.create_rectangle(left, top, right, bottom,
-                                      fill=(theme.bg_dead or "") if dead
-                                      else (theme.female if gender == "女" else ""),
+                                      # ★ 2026-10-04 使用者：「男女一样，只名字一直用红色」
+                                      #   ⇒ 取消女性底纹（原粉底 `theme.female`），男女同色；
+                                      #   女性仍靠**红名**区分（见姓名的 fg 逻辑）。
+                                      fill=(theme.bg_dead or "") if dead else "",
                                       outline=self._node_outline(name),
                                       width=int(1 * self.scale), tags=tags)
-            decor = TIER_DECOR.get(tier)
-            if decor:
-                c.create_line(left + 2, top, right - 2, top,
-                              fill=decor[0], width=int(2 * self.scale))
+            # ★ 2026-10-04 使用者裁定：「**改成有爵色的就画**」——
+            #   原实现只查 `TIER_DECOR`（仅部分爵位有条）⇒ 与时间轴不对称
+            #   （时间轴是"凡有爵色就画"）。现在两个家谱用**同一口径、同一颜色**：
+            #   **有爵色 ⇒ 画满宽薄条**，色取 `theme.tier[tier]`；
+            #   「无」爵位 ⇒ 不画（满屏都画等于没信息）。
+            #   ⚠️ 2026-10-04 **更正**：原注释写「与 `timeline_view.py` 爵色线
+            #      **同一组数**，改一处必改另一处」是**错的** ✗ —— 两个视图的
+            #      `self.scale` **单位不同**：本视图 = **布局倍数**（默认 ≈1.06，
+            #      范围 0.40~2.66），时间轴 = **px/年**（默认 4.0，范围 2.43~12.0）。
+            #      照抄同一表达式会让时间轴粗 4~10 倍（世系框曾因此变成"一排方块"）。
+            #      时间轴那边已改为**归一化**：`1.6 × _dpi.SCALE × _zoom()`，
+            #      默认缩放下正好 = 这儿的 **2px** ✓。
+            #      ⇒ 口径一致、表达式不再相同；改这里请同步核对
+            #        `timeline_view._zoom()` 的换算。
+            if tier in theme.tier and tier not in ("", "无"):
+                c.create_line(left, top, right, top,
+                              fill=theme.tier.get(tier),
+                              width=max(2, int(1.6 * self.scale)))
+
+        # ★ 2026-10-05 使用者：「神 帝 王 三色不够醒目」—— 卡面外圈 2px
+        #   亮色光晕（同色提亮，theme.lighten）；图例三格同步加大黑框。
+        if tier in TIER_TOP:
+            hc = theme.tier.get(tier) or theme.divine
+            c.create_rectangle(left - 2, top - 2, right + 2, bottom + 2,
+                               outline=lighten(hc, 0.45), width=2, tags=tags)
 
         self.person_rect[name] = rect
 
@@ -925,12 +1461,16 @@ class TreeView:
                                 tags=tags)
 
         if info.get("historical", "是") == "是":
-            hs = int(base * 0.7)
+            # ★ 2026-10-11 与时间家谱同规：字号**再小两个**；底垫由**不透明实心块**
+            #   改**半透明点阵**（`stipple`）—— 与「X国世系」框题等别的字相撞时，
+            #   被压住的字能透过点阵看清（"硬币被纸盖住、两边都能见"）；底垫色＝
+            #   画布色 ⇒ 没压到东西时点阵与画布同色，肉眼无变化。
+            hs = max(6, int(base * 0.7) - 2)
             hx, hy = x - nw / 4, y - node_h / 2 - 4 - hs / 2
             pad = 2
             c.create_rectangle(hx - hs / 2 - pad, hy - hs / 2 - pad,
                                hx + hs / 2 + pad, hy + hs / 2 + pad,
-                               fill=theme.bg_canvas, outline=theme.bg_canvas,
+                               fill=theme.bg_canvas, outline="", stipple="gray50",
                                tags=tags)
             c.create_text(hx, hy, text="史", font=(theme.font_name, hs, "bold"),
                           fill=theme.hist or theme.divine, tags=tags)
@@ -998,7 +1538,9 @@ class TreeView:
         if not name or lay is None or name not in lay.positions:
             return
 
-        built = build_popcard(self.canvas, self.theme, self.master.people, name)
+        # app=self.master ⇒ 小传据此去**实录层**取「年龄 / 余寿」（谱牒档里没有这两项）
+        built = build_popcard(self.canvas, self.theme, self.master.people, name,
+                              app=self.master)
         if built is None:
             return
         card, w, h = built
@@ -1271,6 +1813,7 @@ class TreeView:
             ratio = round(cur + ZOOM_STEP * (1 if direction > 0 else -1), 2)
             ratio = max(ZOOM_MIN, min(ZOOM_MAX, ratio))
         self.scale = BASE_SCALE * ratio
+        self._tiles_bump()                # 缩放换代，瓦片作废
         self.rerender(skip_collision=True)
         self.master.on_layout_changed()
         return self.scale
@@ -1281,6 +1824,12 @@ class TreeView:
     # ---------------------------------------------------------------- 事件
     def _on_click(self, event):
         self.canvas.scan_mark(event.x, event.y)
+        self._scan_ok = True                  # 本次手势的 scan 锚已打
+        # ★ T2：记录按下点（阈值判断用）
+        self._press = (event.x, event.y,
+                       self.canvas.canvasx(0), self.canvas.canvasy(0))
+        # ★ 2026-10-11：手势开始 —— 记下视口，供 `_on_drag` 的锚失效看门狗比对
+        self._drag_view = (self.canvas.canvasx(0), self.canvas.canvasy(0))
         name = self._hit(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
         if name:
             self.master.select_person(name)
@@ -1288,11 +1837,66 @@ class TreeView:
             self.master.clear_selection()
 
     def _on_drag(self, event):
-        self.canvas.scan_dragto(event.x, event.y, gain=1)
-        # 拖动中也要排补画（scan_dragto 不一定触发 scrollcommand）
-        self._schedule_paint()
+        """拖动平移。
+
+        ★ 2026-10-04 T2：超点击阈值后进入**快照贴图**模式 —— Tk 滚动无
+        位图优化，`scan_dragto` 每步都是全视口重画（代际实测 96~407ms/步、
+        大谱更糟）；换 1 张视口位图后每步 ≈15ms。快照启动失败则降级走原
+        scan_dragto 路径（拖动中零写、松手分帧补画）。
+        ★ 2026-10-05 平移统一走 **scan_mark/scan_dragto**（Tk 自带指针锚）：
+          自算增量锚（`_last_drag_xy`）依赖 `_on_click` 更新锚点 —— 实测第二次
+          按下时点击处理可能不执行（探针复现），锚点残留上一轮 ⇒ 每轮拖动
+          都从上一轮的轨迹起点重走一遍 = 使用者看到的「恢复原位」。
+          scan 锚在**首次 motion 时就地补打**（`_scan_ok` 门），不依赖 press
+          是否送达 —— 锚点永远取当前指针位置，旧锚残留从根上消失。
+          （滚轮在拖动中已被忽略，scan_dragto 的 mark 绝对轨迹没有回拽源。）
+        """
+        px, py = getattr(self, "_press", (event.x, event.y))[:2]
+        if abs(event.x - px) < 4 and abs(event.y - py) < 4:
+            return                            # 还没超出点击阈值
+        self._grab_dragging = True            # 按住拖动中：停顿也不拆快照
+        c = self.canvas
+        # ★★ 2026-10-11 使用者（第 3 条）：「拖动时**仍然**出现半路回退式抖动」。
+        #   探针实测（`_scratch/_probe_jitter3.py`，纯 scan_dragto 路径）：按下后、
+        #   还没拖过 4px 阈值时**滚一下滚轮** ⇒ 视口被滚走 80px，而 `scan_mark`
+        #   仍停在按下点 ⇒ 下一步 `scan_dragto` 把「按下点」拽回指针处 =
+        #   **反向回退 47px**（正常步长 +11）。
+        #   根因：scan 锚是**一次性**的 —— 任何**非本手势**的视口位移（滚轮、
+        #   滚动条、程序性跳转）都会让它失效，而下一个 motion 就会去"追"旧锚。
+        #   ⇒ 加**锚失效看门狗**：拿「上一步拖动后的视口」比对，不等就地重打锚。
+        #   这一条把所有外部滚动来源**一起**兜住，不必逐个去堵。
+        _v = (c.canvasx(0), c.canvasy(0))
+        if self._drag_view is not None and self._drag_view != _v:
+            c.scan_mark(event.x, event.y)     # 视口被别的源动过 ⇒ 就地重挂锚
+            self._scan_ok = True
+        if self._grab_id is None:
+            if not self._grab_start():
+                # 降级：原路（scan_dragto 平移），松手后分帧补画
+                c.scan_dragto(event.x, event.y, gain=1)
+                self._drag_view = (c.canvasx(0), c.canvasy(0))
+                self._schedule_paint()
+                return
+        if not getattr(self, "_scan_ok", False):
+            c.scan_mark(event.x, event.y)     # 就地补锚（当前指针）
+            self._scan_ok = True
+        c.scan_dragto(event.x, event.y, gain=1)
+        self._drag_view = (c.canvasx(0), c.canvasy(0))
+        self._grab_move()                     # 同步代数条等附属件
+        self._schedule_paint()                # 兜底：松手后分帧重建
+
+    def _on_release(self, event):
+        """松手 = 退出快照模式，分帧补画真实 items（渐进浮现）。"""
+        self._grab_dragging = False
+        self._scan_ok = False
+        self._drag_view = None                # 手势结束（看门狗停摆）
+        self._grab_end()
 
     def _on_wheel(self, event):
+        # ★ 2026-10-11：守卫原来只看 `_grab_dragging`（要超 4px 阈值才置真）——
+        #   按下后没拖够 4px 时滚轮**照滚**，正是上面那处回退的来源。
+        #   `_drag_view` 在**按下**就置了 ⇒ 用它当「左键按住中」的判据。
+        if self._drag_view is not None or getattr(self, "_grab_dragging", False):
+            return "break"                    # 按住拖动中：忽略滚轮（防轨迹回拽）
         if event.state & 4:  # Ctrl + 滚轮 = 缩放
             if self._zoom_after_id:
                 self.master.root.after_cancel(self._zoom_after_id)
@@ -1300,6 +1904,11 @@ class TreeView:
             self._zoom_after_id = None
         else:
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            if self._grab_id is not None or self._grab_start():
+                self._grab_move()         # T2：滚轮走快照贴图
+                self._grab_arm_auto()
+            else:
+                self._schedule_paint()
 
     def _on_right_click(self, event):
         name = self._hit(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))

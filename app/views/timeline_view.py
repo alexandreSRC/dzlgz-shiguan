@@ -15,6 +15,8 @@
 import tkinter as tk
 import tkinter.font as tkfont
 import os
+import time
+import logging
 from tkinter import Scrollbar
 
 from .. import dpi as _dpi
@@ -22,7 +24,9 @@ from .. import jue
 from .. import timeline as T
 from .. import saveload as S
 from ..labels import split_dup
+from ..theme import TIER_TOP, TIER_PRIORITY, lighten
 from ..widgets.popcard import build_popcard
+from ..offscreen import TileRingMixin
 
 RAIL_W = _dpi.px(88)              # 左侧朝代带宽度
 # ★ 2026-09-26 使用者要求：全览缩略条从「顶部横向」改为「左沿纵向」——
@@ -62,7 +66,7 @@ def _era_label(name: str) -> str:
     return name + "朝" if len(name) == 1 else name
 
 
-class TimelineView:
+class TimelineView(TileRingMixin):
     """parent: 容器 Frame; master: App 控制器（提供 people / cfg / 回调）。"""
 
     def __init__(self, parent, theme, master):
@@ -89,8 +93,37 @@ class TimelineView:
         self._pop_widget = None       # 小传浮卡的内嵌 Frame
         self._pop_at = None           # 浮卡在画布坐标里的位置
         self._press = (0, 0, 0.0, 0.0)
+        # ★ 2026-10-11：手势中「上一次拖动后的视口位置」——scan 锚失效看门狗用
+        #   （见 `_on_drag`，与代际 tree_view 同规）。None = 没在按住拖。
+        self._drag_view = None
         self._visible_count = 0
         self.range_start, self.range_end = T.YEAR_START_DEFAULT, T.YEAR_END_DEFAULT
+        # ★ 2026-10-04 T1（拖动卡顿根治）：平移/滚动改「按需补画」——与代际
+        #   tree_view 同一套架构。卡片是持久 item（tag 带 p_人名），出视口删除、
+        #   进视口补画；不再每次 B1-Motion 都 delete("all") 全删全建
+        #   （实测 redraw 单次 ≈425ms，拖动每个鼠标事件都跑它 ⇒ 卡成幻灯片）。
+        self._paint_job = None        # 补画去抖句柄（canvas.after）
+        self._drawn_people = set()    # 画布上已有卡片的人（增量补画的账本）
+        self._resize_job = None       # 窗口尺寸变化的重画去抖
+        # ★★ 2026-10-04 T2（拖动卡顿·架构级）：**Tk Canvas 的滚动没有位图
+        #   滚动优化 —— 每次 xview/yview 平移都是「全视口从头重画」**（实测
+        #   本机：视口内 ~400 个中文文字块 ⇒ 平移一步 836~908ms；而单条线
+        #   create+落屏 0.0ms、独立 rail 画布 2ms ⇒ 成本 ≈ 文字光栅化）。
+        #   ⇒ 增量补画救不了平移（平移期间根本不发生 create）。
+        #   解法 = **快照贴图**：拖动/滚动开始时把视口截成一张位图
+        #   （PrintWindow + PIL，全视口重画 1 张 image ≈ 15ms），期间所有
+        #   平移只挪这张图（跟手丝滑）；交互结束（松手/停顿 300ms）后删图、
+        #   **分帧**渐进补画真实 items（每帧预算 12ms、帧间 after(15)——
+        #   每帧 dirty 小，不掉帧，像地图瓦片渐进加载）。
+        self._grab_id = None          # 快照 image 的 item id（None = 非快照模式）
+        self._grab_photo = None       # ImageTk.PhotoImage（防 GC）
+        self._grab_release_job = None # 快照模式的自动恢复定时器（滚轮/滚动条用）
+        self._grab_dragging = False   # 按住拖动中（停顿不拆快照 —— 防闪现）
+        self._grab_busy = False       # 快照抓图中（防重入踩踏）
+        self._grab_underlay = None    # 松手后的垫底快照图 item id（补画完才删）
+        self._grab_underlay_photo = None
+        self._paint_steps = None      # 分帧补画的步骤队列（闭包列表）
+        self._tiles_init()            # 拖动底图瓦片（离屏预渲染环）
 
         self._fonts_cache = {}        # 字号 → tkfont.Font（量宽度用）
         self._size_cache = {}         # 人名 → 该人名的弹性字号
@@ -126,6 +159,10 @@ class TimelineView:
         self.canvas = tk.Canvas(body, bg=theme.bg_canvas, highlightthickness=0,
                                 bd=0, cursor="hand2")
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # ★ 2026-10-04 使用者：画布**右上角固定**显示「爵位颜色注」（拖动不变）。
+        from ..widgets.kit import tier_legend
+        # ★ 2026-10-05 图例挂容器、`in_` 对齐画布（拖动快照不再拍进图例鬼影）。
+        self._legend = tier_legend(self.canvas.master, theme, in_=self.canvas)
 
         self.vbar = Scrollbar(body, orient=tk.VERTICAL, command=self._yview,
                               bg=theme.border_2, troughcolor=theme.bg_panel,
@@ -133,10 +170,15 @@ class TimelineView:
                               bd=0, width=theme.scrollbar_w, relief=tk.FLAT)
         self.vbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # ★ 2026-10-07 使用者（续七十二）：「时间家谱最下方的**左右拖动 bar** 的
+        #   厚度改成**下面踢脚线一样的厚度**，这么细点起来有点费劲」
+        #   —— 原来没写 `width`，走 Tk 默认（约 17px，`bd=0` 后更显细）；
+        #   改成与底部状态栏同厚（`theme.statusbar_h = 28`），好点好拖。
+        #   （竖条 `vbar` 未动，仍是 `theme.scrollbar_w = 10`。）
         self.hbar = Scrollbar(outer, orient=tk.HORIZONTAL, command=self._xview,
                               bg=theme.border_2, troughcolor=theme.bg_panel,
                               activebackground=theme.accent, highlightthickness=0,
-                              bd=0, relief=tk.FLAT)
+                              bd=0, width=theme.statusbar_h, relief=tk.FLAT)
         self.hbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.configure(yscrollcommand=self._on_yscroll,
                               xscrollcommand=self._on_xscroll)
@@ -144,6 +186,7 @@ class TimelineView:
         self.canvas.bind("<Configure>", self._on_configure)
         self.canvas.bind("<ButtonPress-1>", self._on_click)
         self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Double-Button-1>", self._on_double)
         self.canvas.bind("<ButtonPress-3>", self._on_right_click)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
@@ -174,28 +217,53 @@ class TimelineView:
         return self.lay is not None and self.lay.positions
 
     # ================================================================ 布局
+    def _filter_sig(self):
+        """筛选状态指纹 —— **布局缓存键的一部分**。
+
+        ★★ 2026-10-04 使用者报「**隐藏非史功能不能用**（勾了**完全没反应**）」：
+          布局缓存的键原来**只有比例尺** ⇒ 只切换筛选项（隐藏非史/隐藏逝者/
+          仅显入谱/仅显所选/截断）时**键不变** ⇒ 命中旧缓存 ⇒ 画布毫无变化 ✗。
+        ⇒ 把所有参与过滤的开关都编进键，一个都不能少。
+        """
+        m = self.master
+        return (bool(getattr(m, "hide_nohist_all", False)),
+                bool(getattr(m, "hide_dead", False)),
+                bool(getattr(m, "enrolled_only", False)),
+                bool(getattr(m, "focus_only", False)),
+                getattr(m, "cutoff_person", None))
+
     def rerender(self, keep_scale=True, cache_ok=False):
         """重算布局。缩放变化后调它；平移不必重算。
 
         `cache_ok`：缩放时允许命中「同一比例尺上次算过的布局」—— 来回缩放就不用反复重算。
         改数据（`_refresh_all`）时必须传 False，否则会拿到过期布局。
         """
+        self._tiles_bump()                # 布局重算 = 内容换代，瓦片作废重铺
         people = self.master.people
         # ★ 2026-09-23 手动「选定」的人穿透所有过滤层（与主树同规）—— 否则
         #   选定已故者或未入谱者时画布无变化，使用者会以为「选定点了没反应」
         _pin = set(getattr(self.master, "focused", ()) or ())
+        # ★ 2026-10-04 父链向上连通（使用者拍板，与代际树 `_ancestor_chains`
+        #   同规）：选定者的祖先一并豁免滤镜 —— 否则「仅显所选」只留选定者+
+        #   男性后裔，祖先被挡，选定的人在时间轴上悬空成孤点（实测纪黯/纪信）。
+        _anc = set()
+        if _pin:
+            from ..layout import _ancestor_chains
+            _anc = _ancestor_chains(people, _pin)
         # 画布默认只画点名过的人（入谱 / 加入族谱）
         if getattr(self.master, "enrolled_only", True):
-            keep_enr = set(self.master.enrolled_set()) | _pin
+            keep_enr = set(self.master.enrolled_set()) | _pin | _anc
             people = {n: v for n, v in people.items() if n in keep_enr}
         if getattr(self.master, "hide_dead", False):
             people = {n: v for n, v in people.items()
-                      if not (v or {}).get("death") or n in _pin}
+                      if not (v or {}).get("death")
+                      or n in _pin or n in _anc}
         # ★ 2026-09-24 侧栏「隐藏非史」全局开关（与主树同规：勾上隐藏全部
         #   非史实人物；手动「选定」的人照旧穿透）
         if getattr(self.master, "hide_nohist_all", False):
             people = {n: v for n, v in people.items()
-                      if (v or {}).get("historical") == "是" or n in _pin}
+                      if (v or {}).get("historical") == "是"
+                      or n in _pin or n in _anc}
         if getattr(self.master, "focus_only", False):
             foc = set(getattr(self.master, "focused", ()))
             if foc:
@@ -219,6 +287,8 @@ class TimelineView:
                     for s in (people[n].get("spouses") or []):
                         if s in people:
                             keep.add(s)
+                # ★ 2026-10-04：祖先链不被「仅显所选」裁掉（父链向上连通）
+                keep |= _anc
                 people = {n: v for n, v in people.items() if n in keep}
             else:
                 people = {}
@@ -237,17 +307,28 @@ class TimelineView:
             self._framed = False
         self.range_start, self.range_end = T.year_bounds(years, now=self._game_year())
 
-        key = round(self.scale, 4)
+        # ★★ 2026-10-04 使用者报「**隐藏非史功能不能用**（勾了**完全没反应**）」——
+        #   真因就在这一行：布局缓存**键里只有比例尺** ✗ ⇒ 只切换筛选项
+        #   （隐藏非史 / 隐藏逝者 / 仅显入谱 / 仅显所选 / 截断）时**键不变** ✗
+        #   ⇒ 命中旧缓存 ⇒ 复用的还是**没过滤**的那份布局 ⇒ 画布毫无变化。
+        #   ⇒ 把筛选项一起编进键（换档/缩放/切筛选都会各自失效）。
+        # ★ 2026-10-06 上色爵称映射提前：宗支排序（爵位优先）在 compute 里
+        #   就要用它（与世系框框色同一口径）。
+        from .. import jue as jue_mod
+        jue_mod.install_from_save(getattr(self.master, "current_save", ""))
+        tier_map = jue_mod.tier_colors_for(self.master.people)
+        self._tier_map = tier_map
+        key = (round(self.scale, 4), self._filter_sig())
         cached = self._cache.get(key)
         if cached is not None:
             self.lay = cached
         else:
             self.lay = T.compute(people, scale=self.scale, width_of=self._card_w,
-                                 card_h=T.PLATES[self.plate][0])
+                                 card_h=T.PLATES[self.plate][0], tiers=tier_map)
+            self._attach_orphans(people)      # ★ 第二遍：孤儿挂靠定位（续六十五）
             if len(self._cache) >= 3:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[key] = self.lay
-
         w = max(self.lay.width, 10)
         h = max(self.lay.height, 10)
         # ★ 2026-09-23 使用者要求「过滤后空白的画布都隐藏」：内容比视口矮时
@@ -264,8 +345,12 @@ class TimelineView:
                     self._size_cache.clear()
                     self.lay = T.compute(people, scale=self.scale,
                                          width_of=self._card_w,
-                                         card_h=T.PLATES[self.plate][0])
-                    self._cache[round(self.scale, 4)] = self.lay
+                                         card_h=T.PLATES[self.plate][0],
+                                         tiers=tier_map)
+                    # ⚠️ 与上面同一个键（含筛选项）—— 否则这一处存进去的会在
+                    #    切换筛选后被当成"旧布局"命中（见 `_filter_sig` 说明）。
+                    self._attach_orphans(people)      # 重算后同样补挂靠
+                    self._cache[(round(self.scale, 4), self._filter_sig())] = self.lay
                     w = max(self.lay.width, 10)
                     h = max(self.lay.height, 10)
         self.canvas.configure(scrollregion=(0, 0, w, h))
@@ -286,21 +371,90 @@ class TimelineView:
             #   时间轴永远 0 个世系框（这是「时间家谱看不到 X 国世系」的真凶）。
             # ★ 2026-09-26（M1）：框色接 **tier_of** 上色爵称（主树八十二批已接，
             #   时间轴漏了）—— 与铭牌同一口径，一次算好全谱映射再传入。
-            jue_mod.install_from_save(getattr(self.master, "current_save", ""))
-            tier_map = jue_mod.tier_colors_for(self.master.people)
-            self._tier_map = tier_map
+            # ★ 2026-10-04：与代际同规 —— 框改走**家族框**（`gongqing.frame_groups`）。
+            #   （tier_map 已在 rerender 开头算好 —— 宗支排序也要用它。）
+            from app import gongqing as _GQ
+            _ppl = self.master.people
+            _slot = getattr(self.master, "record_slot", None)
+            # ★★ 性能：与代际同规 —— 分组是纯计算、与视口无关，**按 people 缓存**，
+            #   免得每帧重跑（`_lineage_groups` 7.7ms 是卡顿主因）。
+            _ck = (id(_ppl), len(_ppl))
+            _cache = getattr(self, "_frame_cache", None)
+            if _cache is not None and _cache[0] == _ck:
+                _fr = _cache[1]
+            else:
+                _fr = None
+                if _slot is not None:
+                    _lin = L._lineage_groups(
+                        _ppl, self.lay.positions,
+                        any(v.get("lineage_name") for v in _ppl.values()))
+                    _fr = _GQ.frame_groups(_slot, _ppl, _lin) or None
+                self._frame_cache = (_ck, _fr)
             self._state_boxes = L.state_group_boxes_timeline(
                 self.master.people, self.lay.positions, self.lay.widths,
                 self.lay.card_h, self.theme.tier,
                 # ★ 2026-09-23 与代际同规：退让阈值要用**真字宽**（9pt 隶书约 13px），
                 #   原来写死的 8.0 偏小 → 框明明放不下整题也硬写全称。
-                char_w=self.font_rail.measure("世"), tier_of=tier_map)
+                char_w=self.font_rail.measure("世"), tier_of=tier_map,
+                # ⚠️ 与代际同规：用 `key` 建字典，标题允许同名。
+                groups=({f["key"]: f["members"] for f in _fr} if _fr else None),
+                titles=({f["key"]: f["title"] for f in _fr} if _fr else None))
         except Exception:
-            self._state_boxes = []
+            pass                                  # 世系框计算失败 = 本轮无框
         self._draw_mini()
         self.redraw()          # 镜头定位不在这里做 —— 见 _on_configure
         self._draw_popcard()   # 重排后浮卡要跟着卡片挪位置
         return self.lay
+
+    def _attach_orphans(self, people):
+        """孤儿挂靠定位（★ 2026-10-06 使用者提案，续六十五）。
+
+        无父无母的史实节点在时间轴上是"根"，独立占列，同家族的世系框按成员
+        包围盒画 ⇒ 孤儿排得远就把框撑出十几屏（实测：汉·刘泽）。
+        第一遍布局（不带家族）出来后，取 `gongqing.frame_groups` 的家族归属，
+        带 `families` **重算一遍** —— `T.compute` 会把这类孤儿定位挂靠到
+        同家族生年最近的族人旁（只定位不画线）。无槽/无分组/无孤儿时零收益
+        但也零成本（第二遍 ≈65ms，rerender 本就 90ms 去抖）。
+        """
+        try:
+            from app import gongqing as _GQ
+            from app import layout as _L
+            _ppl = self.master.people
+            _slot = getattr(self.master, "record_slot", None)
+            if _slot is None:
+                return
+            _lin = _L._lineage_groups(
+                _ppl, self.lay.positions,
+                any(v.get("lineage_name") for v in _ppl.values()))
+            _fr = _GQ.frame_groups(_slot, _ppl, _lin) or None
+            if not _fr:
+                return
+            families = {m: f["key"] for f in _fr for m in f["members"]}
+            # ★ 2026-10-11：继任链 / 家族爵位两项判据都搬进 `app/gongqing.py`
+            #   （`succession_map` / `family_ranks`）—— 代际家谱的根排序也要用同一份。
+            #   guo_rank 仍就地算（供 `T.compute` 的旧参数用）。
+            guo_rank = {}
+            king_t = _slot.table(_GQ.KING_TABLE) if hasattr(_GQ, "KING_TABLE") else None
+            if king_t is not None:
+                for row in king_t.rows:
+                    ents = _GQ._parse_king_str(row.get("King_Str") or "")
+                    if ents:
+                        guo_rank[str(row.get("King_Name") or "")] = \
+                            T.TIER_PRIORITY.get(str(ents[-1][3] or "").strip(), 1)
+            fam_rank = _GQ.family_ranks(_slot, _fr)
+            succession = _GQ.succession_map(_slot)
+            lay2 = T.compute(people, scale=self.scale, width_of=self._card_w,
+                             card_h=T.PLATES[self.plate][0], families=families,
+                             tiers=getattr(self, "_tier_map", None),
+                             succession=succession, guo_rank=guo_rank,
+                             fam_ranks=fam_rank)
+            if getattr(lay2, "attach_count", 0):
+                self.lay = lay2
+                self._frame_cache = ((id(_ppl), len(_ppl)), _fr)   # 顺手暖框缓存
+        except Exception:
+            pass                                  # 挂靠失败 = 维持第一遍布局
+
+
 
     def _scroll_to_content(self):
         """把视口对到「人最密的那一屏」。
@@ -432,20 +586,30 @@ class TimelineView:
         tier_fill = (bool(color) and tier in theme.tier
                      and tier not in ("", "无") and not (sel or focus))
         female = info.get("gender", "") == "女"
+        # ★ 2026-10-04 使用者：「时间家谱里面**爵位色没体现出来在铭牌填充上**」。
+        #   实测真因：填色优先级里 `focus`（选定高亮）**压在爵色之上**，而「选定」与
+        #   「关注」是**同一张名单**（右键「选定（仅显所选）」写的就是它），公卿自动
+        #   关注把它填到 701 人、连男性后裔共 **1754** 人 ⇒ 其中 **22 位有爵者**
+        #   的爵色被 focus_bg 完全盖掉（占全部有爵者 100 人里的 22%）。
+        #   ⇒ 把 `focus` 挪到爵色**之下**：爵色填底照常，选定改由**描边**表达
+        #     （第 472-473 行本来就在画 `focus_hi` 边框 + width 2，**一点都不丢**）。
         if sel:
             fill = theme.accent_soft
+        elif dead:
+            # ★ 2026-10-04 使用者：「**已故要一眼看出来**」⇒ 已故**一律压灰**。
+            #   原先「有爵位的已故」走 `dead and tier_fill ⇒ 爵色填底 + 灰字`
+            #   （2026-09-26 决选 6B）⇒ 远看仍是**彩牌** ✗，与代际家谱不一致。
+            #   现在统一压灰；**爵位改由四边描边表达**（见下方 `color and (dead or …)`），
+            #   所以「他是帝/王/公…」这条信息**一点没丢**。
+            fill = theme.bg_dead or theme.bg_card
         elif focus:
             fill = theme.focus_bg
-        elif dead and tier_fill:
-            fill = color
-        elif dead:
-            fill = theme.bg_dead or theme.bg_card
-        elif tier_fill and female:
-            fill = self._tint(color)
-        elif tier_fill:
-            fill = color
         else:
-            fill = theme.bg_card
+            # ★ 2026-10-04 使用者：「时间家谱的铭牌和配色没代际好看……**改一下配色**」
+            #   ⇒ 底改成与**代际同规**：**透明**（原来按爵位整块填色，显得笨重）。
+            #   爵位改由「顶部一道爵色装饰线 + **爵色名字**」表达（见下）。
+            #   ⚠️ 只改配色：几何、纵坐标（＝时间）、史实徽标、逻辑一律不动。
+            fill = ""
         # ★ 2026-09-28 全项目整理（第 2 批，铁律②「没有任何汉字被遮盖」）：
         #   本函数的矩形与文字原来**一个 tag 都没带**，而时间轴也**没有任何提层
         #   机制** ⇒ 后画的**右邻卡矩形**盖住本卡**卡外右侧的尊号**、下邻卡矩形
@@ -458,12 +622,34 @@ class TimelineView:
                            outline=(theme.accent if sel
                                     else (theme.focus_hi if focus else theme.border_2)),
                            width=2 if (sel or focus) else 1, tags=_pt)
+        # ★ 2026-10-05 使用者：「神 帝 王 三色不够醒目」—— 铭牌外圈 2px 亮色
+        #   光晕（同色提亮，theme.lighten）；带 `p_{name}` tag，随卡生灭。
+        if tier in TIER_TOP:
+            hc = color or theme.divine
+            c.create_rectangle(x - half - 2, y - 2, x + half + 2, y + ch + 2,
+                               outline=lighten(hc, 0.45), width=2, tags=_pt)
         # ★ 2026-09-26 使用者要求：爵位色不再只画**左沿一道竖杠**，改成**四边描边**
         #   （上下左右都带色）。竖排铭牌只有 20px 宽，色框压在内侧会把名字挤没，
         #   所以直接沿卡片外沿画 2px；选中/聚焦时让位给主色边框（不然看不见选中）。
-        if color and not tier_fill and not (sel or focus):
-            c.create_rectangle(x - half, y, x + half, y + ch,
-                               fill="", outline=color, width=2, tags=_pt)
+        # ★ 2026-10-04：已故一律压灰之后，**有爵位的已故**不再自带爵色填底 ⇒
+        #   必须给它补一条爵色描边（否则爵位在这张牌上就真的看不见了）。
+        if tier_fill:
+            # ★ 2026-10-04 使用者裁定：「**有爵色的就画**」（与代际同口径）——
+            #   `tier_fill` 的定义本身就是「有真爵色（主题爵色表的键）且不是「无」、
+            #   且未选中/聚焦」⇒ 正好是这句话。原来这里是「凡是 color 就画」
+            #   （`color` 对「无」爵位会兜底成灰 ⇒ 人人都有条 ✗），与代际不对称。
+            #   另：与代际**同尺寸** —— 「左右＝铭牌宽度、上下更薄」⇒ 满宽 + `1.6 × 单位`。
+            #   ⚠️⚠️ 2026-10-04 修正**单位错**（与世系框变"方块"同一个根因）：
+            #      本视图 `self.scale` 是 **px/年**（`SCALE_DEFAULT=4.0`，范围 2.43~12.0），
+            #      代际 `self.scale` 是**布局倍数**（默认 1.06，范围 0.4~2.66）——
+            #      **两者差 4 倍以上、语义完全不同** ✗。照抄 `1.6 × self.scale`
+            #      在这里等于 4~19px，比代际粗一至十倍 ✗
+            #      （原注释写「与代际完全同尺寸」是**假的** ✗）。
+            #      ⇒ 改乘**归一化缩放** `_zoom()`，默认缩放下恰好 ≈ 代际的 2px ✓。
+            c.create_line(x - half, y + 1, x + half, y + 1,
+                          fill=color,
+                          width=max(2, int(1.6 * _dpi.SCALE * self._zoom())),
+                          tags=_pt)
         # 竖排铭牌一个字一行 —— Tk 的 create_text 不支持竖写，用换行手动摞
         # ★ 2026-09-22 重名序数（纯数字）拆出来画成**右上角的小号灰字角标**
         #   （与主树同一套做法）—— 原来它占整整一行，竖排时看着像名字里多了一个字。
@@ -486,16 +672,14 @@ class TimelineView:
         #   （绿/紫/青/金棕）上字发糊 —— 填色铭牌**统一白字 + 深色描影**，
         #   浅色底（王金）也靠描影保住轮廓；已故用洗白灰仍算「灰字示亡」。
         name_shadow = None
-        if dead and tier_fill:
-            name_fg = "#d8d3c6"             # 决选 6B：灰字示亡（描影兜底可读）
-            name_shadow = True
-        elif female:
-            name_fg = theme.spouse          # 决选 7C：女性红名不变（淡底无需影）
-        elif tier_fill:
-            name_fg = "#ffffff"
-            name_shadow = True
+        # ★ 2026-10-04 使用者实测：「时间家谱去世的人名字是**白色**，都快被**灰色填充
+        #   淹没**了」—— 上一版我给它灰白字（`#d8d3c6`）压在灰底上 ⇒ 看不清 ✗。
+        #   **代际家谱的已故不染名字**（只把**底**压灰 ✓），所以对齐口径就是：
+        #   名字一律用**正常字色**（女性红 / 其余爵色），**已故只由灰底表达**。
+        if female:
+            name_fg = theme.spouse          # 决选 7C：女性红名不变
         else:
-            name_fg = theme.text
+            name_fg = theme.tier.get(tier, theme.text) if tier else theme.text
         # ★ 2026-09-26 修横牌溢出：竖排居中没错，横排的 name_x 是**左缘**，
         #   却也用 center 锚 —— 半个名字挂到框外去了（使用者报「横牌字溢出」）。
         if name_shadow:
@@ -518,6 +702,37 @@ class TimelineView:
         if info.get("fief_gen", 0) > 0:
             c.create_text(x, y + ch + 7, text=str(info["fief_gen"]),
                           font=self.font_tick, fill=theme.text_2, tags=_tt)
+        # ★ 2026-10-07 使用者（续七十二）：「**时间家谱是不是没有史实标志？**」
+        #   —— 确实**没有**（代际家谱在节点左上角画一个小小的「**史**」，本视图
+        #   一直漏着）。**学习代际**（同一套视觉语言，用户不用学第二套）：
+        #     · 只给**史实**人物画（`historical == "是"`），非史实者不加标；
+        #     · 位置 = 卡片**上沿外** 4px、横向 `x - half/2`（＝代际的 `x - nw/4`）；
+        #     · 底垫一块底色（代际同款）—— 免得被连线/相邻卡的底压住；
+        #       ★ 2026-10-11 起改**半透明点阵**，见下。
+        #     · 挂 `_tt`（文字层）⇒ 批末统一提层，不会被邻卡盖住。
+        #   尺寸 = 名字字号 × 0.7 再减 4pt（下限 6pt），见下。
+        #   ★ 2026-10-07 使用者实测「**史实标志太大了，缩小两个字号试试**」
+        #     ⇒ 在「名字字号 × 0.7」的基础上**再减 2pt**（下限 6pt）。
+        #   ★ 2026-10-11 使用者：「史徽标经常把『X国世系』的字挡住」。本层
+        #     （`platetext`）在提层序列里**最顶**（压 `sboxtitle`）⇒ 徽标会盖住
+        #     框题白字。要求：**再小两个字号**，且**盖到别的字时化作阴影底**——
+        #     「硬币被纸盖住：硬币可见，纸上盖住硬币处的字也可见」。
+        #     做法：底垫由**不透明**（`outline=bg_canvas` 实心块）改**半透明点阵**
+        #     （`stipple="gray50"`，且去掉实心描边）⇒ 被它压住的字透过点阵仍可读；
+        #     底垫色本就是画布色 ⇒ **没压到东西时点阵与画布同色、肉眼无变化**
+        #     （不会给正常徽标添灰）。字号在「名字 × 0.7 − 2」（2026-10-07 定的）
+        #     基础上**再减 2**，下限 6pt。
+        if info.get("historical", "是") == "是":
+            hs = max(6, int(round(size * 0.7)) - 4)
+            hx = x - half / 2.0
+            hy = y - 4 - hs / 2.0
+            c.create_rectangle(hx - hs / 2.0 - 2, hy - hs / 2.0 - 2,
+                               hx + hs / 2.0 + 2, hy + hs / 2.0 + 2,
+                               fill=theme.bg_canvas, outline="", stipple="gray50",
+                               tags=_tt)
+            c.create_text(hx, hy, text="史",
+                          font=(theme.font_name, hs, "bold"),
+                          fill=theme.hist or theme.divine, tags=_tt)
 
     def _draw_dup_mark(self, c, cx, cy, base_name, dup, name_size, vertical=True,
                        tags=None):
@@ -695,11 +910,18 @@ class TimelineView:
 
     # ================================================================ 绘制
     def redraw(self):
+        """全量重绘 —— 只在**布局真正变了**时用（初始 / 缩放 / 换谱 / 选中变化）。
+
+        ★ 2026-10-04 T1：**平移与滚动不再走这里** —— 改走 `_schedule_paint`
+        的按需补画（视口 ± 半屏增量）。原来拖动每个 B1-Motion 都
+        `delete("all")` 全删全建，实测单次 ≈425ms（纯调用 16~90 + 落屏
+        320~490），事件率 60~125Hz ⇒ 拖成幻灯片；全量重绘只留给低频操作。
+        """
         c = self.canvas
         c.delete("all")
         if not self._ready:
             return
-        theme, lay = self.theme, self.lay
+        lay = self.lay
         vw, vh = self._viewport()
         vx0 = c.canvasx(0)
         vy0 = c.canvasy(0)
@@ -708,89 +930,15 @@ class TimelineView:
         # ---- 1) 朝代带（跟随纵向滚动，横向固定）----
         self._draw_rail()
 
-        # ---- 2) 年格线 ----
-        step = _nice_step(58, self.scale)
-        ytop = lay.year_at(max(vy0 - lay.card_h, 0))
-        ybot = lay.year_at(vy1)
-        yr = int(ytop // step) * step
-        while yr <= ybot:
-            yy = lay.y_of(yr)
-            if vy0 - 20 <= yy <= vy1 + 20:
-                c.create_line(0, yy, max(vx1, vw) + 4000, yy, fill=theme.grid)
-                c.create_text(6, yy - 7, text=_fmt_short(yr), anchor="w",
-                              font=self.font_tick, fill=theme.text_3)
-            yr += step
+        # ---- 2) 年格线 —— 已并入 `_draw_grid`（T1）----
+        self._draw_grid(vx0, vy0, vx1, vy1)
 
-        # ---- 3) 世系虚线框（★ 2026-09-23 使用者要求时间轴也显示「X国世系」大圈）----
-        # 画在连线与卡片**之下**：卡片不透明，线在卡里被挡，框也一样 —— 先画框，
-        # 后面画的连线/卡片自然盖在上面，框就只是背景轮廓，不会糊住文字。
-        # 框标题压色块、贴在框顶，卡片画完后仍可见（标题区没有卡片）。
-        for min_x, min_y, max_x, max_y, color, title in self._state_boxes:
-            if max_x < vx0 or min_x > vx1 or max_y < vy0 or min_y > vy1:
-                continue
-            c.create_rectangle(min_x, min_y, max_x, max_y, fill="", outline=color,
-                               width=1, dash=(4, 3))
-            if title:
-                # ★ 2026-09-23 使用者反馈「世系 bar 不是弹性的」：原来按
-                #   `len(title) * 8.0` 估宽，而 9pt 隶书的实际字宽约 13px ——
-                #   实测「朝鲜世系」文字 52px 而色条只有 32px，白字两端溢出到
-                #   浅色画布上**根本看不见**，看着就像「XX世系」缺了字。
-                #   改成按真字体量宽（+10 内边距），色条随文字伸缩；仍夹在框内。
-                tw = min(self.font_rail.measure(title) + 10, max_x - min_x - 4)
-                cx = min_x + (max_x - min_x) / 2
-                c.create_rectangle(cx - tw / 2, min_y, cx + tw / 2, min_y + 13,
-                                   fill=color, outline=color)
-                c.create_text(cx, min_y + 7, text=title,
-                              font=self.font_rail, fill="#ffffff")
+        # ---- 3) 世系/家族框 —— 已并入 `_draw_state_boxes`（T1）----
+        self._draw_state_boxes(vx0, vy0, vx1, vy1)
 
-        # ---- 4) 连线（**画在卡片之下**；只算看得见的那几条，其余惰性）----
-        # ★ 2026-09-22 使用者要求「母亲连线也做」：挂在母亲枝下的主线画
-        #   婚姻色虚线；父母都在时母亲另有一条虚线（与族谱同款语义）。
-        margin = 220.0          # 绕行折线可能超出两端点包围盒，留足余量
-        ends = []               # 连线的接入点，等卡片画完再补小圆点
-        attach_m = getattr(lay, "attach_mother", ())
-
-        def _in_vp(ax, ay, bx, by):
-            return not (max(ax, bx) < vx0 - margin or min(ax, bx) > vx1 + margin
-                        or max(ay, by) < vy0 - margin or min(ay, by) > vy1 + margin)
-
-        for (f, n, ax, ay, bx, by) in lay.link_pairs:
-            if n in attach_m:
-                continue                # 挂母线在下面单独画虚线
-            if not _in_vp(ax, ay, bx, by):
-                continue
-            pts = lay.path_for(n)[0]
-            if not pts:
-                continue
-            c.create_line(*[v for p in pts for v in p],
-                          fill=theme.tree_line, width=1)
-            ends.append((pts[0], pts[-1]))
-        for n in attach_m:
-            pair = lay._pair_of.get(n)
-            if pair is None:
-                continue
-            _f, _n, ax, ay, bx, by = pair
-            if not _in_vp(ax, ay, bx, by):
-                continue
-            pts = lay.path_for(n)[0]
-            if not pts:
-                continue
-            c.create_line(*[v for p in pts for v in p],
-                          fill=theme.spouse, width=1, dash=(3, 2))
-            ends.append((pts[0], pts[-1]))
-        for _m, n in getattr(lay, "mother_extra", ()):
-            pair = lay._mother_pair_of.get(n)
-            if pair is None:
-                continue
-            _f, _n, ax, ay, bx, by = pair
-            if not _in_vp(ax, ay, bx, by):
-                continue
-            pts = lay.path_for_mother(n)[0]
-            if not pts:
-                continue
-            c.create_line(*[v for p in pts for v in p],
-                          fill=theme.spouse, width=1, dash=(3, 2))
-            ends.append((pts[0], pts[-1]))
+        # ---- 4) 连线（父子/挂母/母系额外/夫妻线）—— 已并入 `_draw_links`（T1）----
+        # 返回接入点列表，端点圆点等卡片画完再补（`_draw_enddots`）。
+        ends = self._draw_links(vx0, vy0, vx1, vy1)
 
         # ---- 4) 卡片 ----
         n_vis = 0
@@ -807,33 +955,202 @@ class TimelineView:
             drawn_names.append(name)
             self._draw_card(name, x, y, w)
         # ★ 2026-09-28 全项目整理（第 2 批，铁律②「没有任何汉字被遮盖」）：
-        #   时间轴原本**完全没有层级管理** —— 卡片矩形与名字/尊号/封代都不带 tag，
-        #   于是**后画的右邻卡矩形**盖住本卡**卡外右侧的尊号**、下邻卡矩形盖住
-        #   **卡下方的封代数字**（这两个字都画在卡片之外，最容易被后画的卡吃掉）。
-        #   现在：矩形 → `platebg`（另带人名 tag，随人一起删）；文字 → `platetext`。
-        #   本屏所有卡画完，把 `platetext` 提到 `platebg` 之上 ⇒ 字永远在底之上。
-        for _tag in ("platebg", "platetext"):
-            try:
-                self.canvas.tag_raise(_tag)
-            except Exception:
-                pass
+        #   卡片矩形 → `platebg`（另带人名 tag，随人一起删）；文字 → `platetext`。
+        #   ★ 2026-10-04 T1：提层统一挪到 `_raise_layers()`（拍末一次做完，
+        #     静态连线/世系框一并压到字下）；这里只同步「本屏卡片」账本 ——
+        #     `_paint_viewport` 靠它做增量补画。
         self._visible_count = n_vis
-        drawn_set = set(drawn_names)
+        self._drawn_people = set(drawn_names)
 
-        # ---- 4.5) 夫妻红线（2026-09-22 使用者要求）----
-        # 只连两端都在本屏的配偶；线形按使用者裁定改成**天平状折线**
-        # （族谱同款 U 型：两卡下沿各垂一段、中间一根横杆、杆下一颗 ♥），
-        # 直愣愣的斜线不好看。去重：配偶关系对称，只从字典序小的一端画一次。
-        # ★ 2026-09-23：改淡红虚线（spouse_line 空串回退 spouse）。
-        sp_line = theme.spouse_line or theme.spouse
+        # ---- 夫妻红线已并入 `_draw_links`（2026-10-04 T1）----
+        # 原来画在卡片**之后** ⇒ 处在最顶层，会压住「卡外右侧尊号 / 卡下方
+        # 封代数字」这些字；现在进 `tlinks` 层（卡片之下 + 提层压字下）。
+
+        self._draw_enddots(ends, drawn, vx0, vy0, vx1, vy1)
+        self._draw_warn(vx0, vy0, vx1, vy1)
+        self._raise_layers()
+        # ---- 小传浮卡（重挂回来；Canvas 的 delete("all") 只删图元，不销毁内嵌控件）----
+        self._rehang_popcard()
+        # ★ 2026-10-05 瓦片环：首屏走的是全量同步绘制（不经补画泵），
+        #   预铺触发必须挂在这里 —— 不然时间家谱永远等不到瓦片。
+        self._tile_enqueue_ring()
+        self._tile_prefetch_soon()
+
+    def _draw_grid(self, vx0, vy0, vx1, vy1):
+        """年格线 + 年份文字（tag `grid`；提层后字在一切静态线之上）。
+
+        ★ 2026-10-04 T2：线长收窄到视口内（原 `vx1+4000` 的超宽 bbox 会把
+        每次重绘的 expose 区域放大到数屏宽，实测是 850ms 级卡顿的元凶之一）；
+        平移新暴露的格线段由分帧补画补上。
+        """
+        c, theme, lay = self.canvas, self.theme, self.lay
+        step = _nice_step(58, self.scale)
+        ytop = lay.year_at(max(vy0 - lay.card_h, 0))
+        ybot = lay.year_at(vy1)
+        yr = int(ytop // step) * step
+        while yr <= ybot:
+            yy = lay.y_of(yr)
+            if vy0 - 20 <= yy <= vy1 + 20:
+                c.create_line(vx0 - 20, yy, vx1 + 20, yy, fill=theme.grid,
+                              tags=("grid",))
+                c.create_text(6, yy - 7, text=_fmt_short(yr), anchor="w",
+                              font=self.font_tick, fill=theme.text_3,
+                              tags=("grid",))
+            yr += step
+
+    def _draw_state_boxes(self, vx0, vy0, vx1, vy1):
+        """世系/家族框（tag `sbox`；框题文字单独 `sboxtitle` —— 白字不被线压）。
+
+        ★ 2026-09-23 使用者要求时间轴也显示「X国世系」大圈；框题压色块、
+        贴在框顶。★ 2026-10-04 使用者：「时间家谱的世系框有点细，**粗一点，
+        要比铭牌的线粗**」—— 原实现 `width=1, dash=(4,3)` 确实太细（比铭牌
+        描边的 2 还细）✗。
+        ⚠️⚠️ 但第一版**修错过** —— 直接照抄代际的 `2.8 × self.scale`，而两个
+        视图的 `self.scale` **单位不同** ✗：本视图 = **px/年**（默认 4.0，最大
+        12.0）⇒ 算出 **11~33px** ✗；再配**固定** `dash=(12,5)`（划长 12 <
+        线粗 11）⇒ Tk 渲染成**一排小方块**，使用者当场报「**你这是弄的什么
+        玩意？乱糟糟**」✗。⇒ 正确做法（两条一起）：
+          ① 乘**归一化缩放** `_zoom()` ⇒ 默认缩放下 `_bw = 3px`，
+             只比铭牌线的 2 粗一点 —— 正是他要的"比铭牌粗"；
+          ② **dash 随线宽同比放大** ⇒ 保证"长划"永远是长划，
+             不会因为线变粗而退化成方块（默认时恰为 (12,5)，与代际一致）。
+        ★ 2026-10-07 使用者（续七十一）：「**世系框的线需要再细一点，比铭牌连线
+        略粗即可**」⇒ 默认缩放下的 `_bw` 从 3 收到 **2**（铭牌父子线是 1），
+        系数 2.8 → 1.8、下限 3 → 2；`dash` 仍随之同比缩放（不会退化成方块）。
+        """
+        c = self.canvas
+        for min_x, min_y, max_x, max_y, color, title in self._state_boxes:
+            if max_x < vx0 or min_x > vx1 or max_y < vy0 or min_y > vy1:
+                continue
+            _bw = max(2, int(1.8 * _dpi.SCALE * self._zoom()))
+            _dash = (max(12, int(_bw * 4.0)), max(5, int(_bw * 1.7)))
+            # ★ 2026-10-04 T2：**整族框的 bbox 可以横跨数万 px**（幽国/方雷类，
+            #   一支住在画面另一头），整条 create_rectangle 的超大 bbox 会把
+            #   每次重绘的 expose 区域放大多屏 ⇒ 850ms 级卡顿的元凶之一。
+            #   改为「四条边分别与视口求交」只画看得见的线段 —— 每个 item 的
+            #   bbox ≤ 视口，画得一样（框本来就是背景轮廓，视口外的部分看不见）。
+            _m, _x0 = 40, vx0 - 40          # 略出视口 40px，平移时边缝不闪
+            _x1, _y0, _y1 = vx1 + 40, vy0 - 40, vy1 + 40
+            ix0, iy0 = max(min_x, _x0), max(min_y, _y0)
+            ix1, iy1 = min(max_x, _x1), min(max_y, _y1)
+            if ix1 < ix0 or iy1 < iy0:
+                continue
+            seg = []
+            if min_y >= _y0:                # 上边
+                seg.append((ix0, min_y, ix1, min_y))
+            if max_y <= _y1:                # 下边
+                seg.append((ix0, max_y, ix1, max_y))
+            if min_x >= _x0:                # 左边
+                seg.append((min_x, iy0, min_x, iy1))
+            if max_x <= _x1:                # 右边
+                seg.append((max_x, iy0, max_x, iy1))
+            for (a, b, cc, d) in seg:
+                c.create_line(a, b, cc, d, fill=color,
+                              width=_bw, dash=_dash, tags=("sbox",))
+            if title:
+                # ★ 2026-09-23 使用者反馈「世系 bar 不是弹性的」：原来按
+                #   `len(title) * 8.0` 估宽，而 9pt 隶书的实际字宽约 13px ——
+                #   实测「朝鲜世系」文字 52px 而色条只有 32px，白字两端溢出到
+                #   浅色画布上**根本看不见**，看着就像「XX世系」缺了字。
+                #   改成按真字体量宽（+10 内边距），色条随文字伸缩；仍夹在框内。
+                #   ★ T2：题贴框顶 —— 只在框顶进入视口时画（画在中段等于没画）。
+                if not (vy0 - 40 <= min_y <= vy1 + 40):
+                    continue
+                tw = min(self.font_rail.measure(title) + 10, max_x - min_x - 4)
+                cx = min_x + (max_x - min_x) / 2
+                cx = max(ix0 + tw / 2, min(cx, ix1 - tw / 2))
+                c.create_rectangle(cx - tw / 2, min_y, cx + tw / 2, min_y + 13,
+                                   fill=color, outline=color, tags=("sbox",))
+                c.create_text(cx, min_y + 7, text=title,
+                              font=self.font_rail, fill="#ffffff",
+                              tags=("sboxtitle",))
+
+    def _draw_links(self, vx0, vy0, vx1, vy1):
+        """全部静态连线 —— 父子实线 / 挂母虚线 / 母系额外线 / 夫妻U线（T1 合并）。
+
+        全部挂在 tag `tlinks` + 两端 `p_人名` 上：删一个人名就把「沾亲」的线
+        一并带走；提层后 `tlinks` 永远压在 `platetext` 之下 ⇒ **线不盖字**
+        （2026-10-04 使用者要求；悬停/选中高亮不走这里，不受影响）。
+        ★ 2026-09-22 使用者要求「母亲连线也做」：挂在母亲枝下的主线画
+        婚姻色虚线；父母都在时母亲另有一条虚线（与族谱同款语义）。
+        ★ 夫妻红线（2026-09-22）原本画在卡片**之后** ⇒ 最顶层压字；现挪到
+        卡片之下进 `tlinks` 层。线形按使用者裁定是**天平状折线**（族谱同款
+        U 型：两卡下沿各垂一段、中间一根横杆、杆下一颗 ♥），淡红虚线
+        （spouse_line 空串回退 spouse，2026-09-23）。配偶关系对称，只从
+        字典序小的一端画一次。
+        返回接入点列表（端点圆点在卡片之后画，见 `_draw_enddots`）。
+        """
+        c, theme, lay = self.canvas, self.theme, self.lay
+        pos = lay.positions
+        margin = 220.0          # 绕行折线可能超出两端点包围盒，留足余量
+        ends = []               # 连线的接入点，等卡片画完再补小圆点
+        attach_m = getattr(lay, "attach_mother", ())
         chh = lay.card_h
-        for name in drawn_names:
+
+        def _in_vp(ax, ay, bx, by):
+            return not (max(ax, bx) < vx0 - margin or min(ax, bx) > vx1 + margin
+                        or max(ay, by) < vy0 - margin or min(ay, by) > vy1 + margin)
+
+        def _card_in_vp(name):
+            """卡片可见判定（与 redraw 卡片段同一口径，夫妻线两端用）。"""
+            x, y = pos[name]
+            w = lay.widths[name]
+            return (vy0 - chh <= y <= vy1 and x + w / 2 >= vx0 and x - w / 2 <= vx1)
+
+        for (f, n, ax, ay, bx, by) in lay.link_pairs:
+            if n in attach_m:
+                continue                # 挂母线在下面单独画虚线
+            if not _in_vp(ax, ay, bx, by):
+                continue
+            pts = lay.path_for(n)[0]
+            if not pts:
+                continue
+            c.create_line(*[v for p in pts for v in p],
+                          fill=theme.tree_line, width=1,
+                          tags=("tlinks", f"p_{f}", f"p_{n}"))
+            ends.append((pts[0], pts[-1]))
+        for n in attach_m:
+            pair = lay._pair_of.get(n)
+            if pair is None:
+                continue
+            _f, _n, ax, ay, bx, by = pair
+            if not _in_vp(ax, ay, bx, by):
+                continue
+            pts = lay.path_for(n)[0]
+            if not pts:
+                continue
+            c.create_line(*[v for p in pts for v in p],
+                          fill=theme.spouse, width=1, dash=(3, 2),
+                          tags=("tlinks", f"p_{_f}", f"p_{_n}"))
+            ends.append((pts[0], pts[-1]))
+        for _m, n in getattr(lay, "mother_extra", ()):
+            pair = lay._mother_pair_of.get(n)
+            if pair is None:
+                continue
+            _f, _n, ax, ay, bx, by = pair
+            if not _in_vp(ax, ay, bx, by):
+                continue
+            pts = lay.path_for_mother(n)[0]
+            if not pts:
+                continue
+            c.create_line(*[v for p in pts for v in p],
+                          fill=theme.spouse, width=1, dash=(3, 2),
+                          tags=("tlinks", f"p_{_f}", f"p_{_n}"))
+            ends.append((pts[0], pts[-1]))
+
+        # ---- 夫妻红线（天平状折线）----
+        sp_line = theme.spouse_line or theme.spouse
+        for name in pos:
+            if not _card_in_vp(name):
+                continue
             info = self.master.people.get(name) or {}
             for s in (info.get("spouses") or []):
-                if not s or s <= name or s not in drawn_set:
-                    continue
-                x1, y1 = lay.positions[name]
-                x2, y2 = lay.positions[s]
+                if not s or s <= name or s not in pos:
+                    continue            # 去重：配偶关系对称，只画一次
+                if not _card_in_vp(s):
+                    continue            # 两端都在屏内才连（原 drawn_set 口径）
+                x1, y1 = pos[name]
+                x2, y2 = pos[s]
                 w1, w2 = lay.widths[name], lay.widths[s]
                 if x1 <= x2:
                     lx, rx = x1 + w1 / 2, x2 - w2 / 2
@@ -845,18 +1162,25 @@ class TimelineView:
                     continue            # 两卡几乎同列，U 型没有意义
                 drop = max(b1, b2) + 5.0
                 c.create_line(lx, b1, lx, drop, rx, drop, rx, b2,
-                              fill=sp_line, width=1, dash=(4, 2))
+                              fill=sp_line, width=1, dash=(4, 2),
+                              tags=("tlinks", f"p_{name}", f"p_{s}"))
                 c.create_text((lx + rx) / 2, drop + 8, text="♥",
-                              font=self._fonts(10), fill=sp_line)
+                              font=self._fonts(10), fill=sp_line,
+                              tags=("tlinks", f"p_{name}", f"p_{s}"))
+        return ends
 
-        # ---- 5) 连线接入点（画在卡片**之上**）----
-        # 卡片是不透明的，线在卡里必然被挡；在接口处点一个小圆点，
-        # 「这条线接上了这张卡」才一眼看得出来。
-        # ★ 但**缩得越小越不能画** —— 全档两万人时一屏就有上百上千个端点，
-        #   这个 3px 的实心圆点铺开后整块画布全是麻点，远看就是「很多白点」，
-        #   把朝代色和卡片框全糊掉了（使用者原话：后期朝代画布上很不清晰有很多白点）。
-        #   判据用「本屏卡片占横向的比例」：占了半屏以上说明卡挤成一片，
-        #   此时补点只会变噪点；卡还稀疏时补点才有「接口对上」的信息量。
+    def _draw_enddots(self, ends, drawn, vx0, vy0, vx1, vy1):
+        """连线接入点（tag `enddots`，提层后压在卡框 `platebg` 之上、字之下）。
+
+        卡片是不透明的，线在卡里必然被挡；在接口处点一个小圆点，
+        「这条线接上了这张卡」才一眼看得出来。
+        ★ 但**缩得越小越不能画** —— 全档两万人时一屏就有上百上千个端点，
+          这个 3px 的实心圆点铺开后整块画布全是麻点，远看就是「很多白点」，
+          把朝代色和卡片框全糊掉了（使用者原话：后期朝代画布上很不清晰有很多白点）。
+          判据用「本屏卡片占横向的比例」：占了半屏以上说明卡挤成一片，
+          此时补点只会变噪点；卡还稀疏时补点才有「接口对上」的信息量。
+        """
+        c, theme = self.canvas, self.theme
         END_DOT_MAX = 240
         cards_px = sum(d[2] for d in drawn)
         vw_px = max(vx1 - vx0, 1.0)
@@ -866,22 +1190,358 @@ class TimelineView:
                 for (ex, ey) in (p, q):
                     if vx0 - 6 <= ex <= vx1 + 6 and vy0 - 6 <= ey <= vy1 + 6:
                         c.create_oval(ex - 1.5, ey - 1.5, ex + 1.5, ey + 1.5,
-                                      fill=theme.tree_line, outline="")
+                                      fill=theme.tree_line, outline="",
+                                      tags=("enddots",))
 
-        # ---- 5.5) 竖排低比例警示牌（UI 改进 B9，由状态栏文案改到画布角落）----
-        # 实测：竖排铭牌（卡高 54→**60**，2026-09-26 与代际家谱统一后复测：
-        # 3.0~6.0 px/年 直斜线全为 0，4.4 这个阈值继续沿用，只是更保守）；
-        # 更低时卡片把水平空白巷道挤没了，会有几十条连线只能从卡上压过去（几何必然）。
-        if self.plate == "v" and self.scale < V_PLATE_MIN_SCALE:
-            txt = "竖排铭牌在此缩放下部分连线绕不开 · 放大或换横排"
-            tw = 260
-            c.create_rectangle(vx1 - tw - 8, vy1 - 30, vx1 - 8, vy1 - 8,
-                               fill=theme.bg_card, outline=theme.warn, width=1)
-            c.create_text(vx1 - tw // 2 - 8, vy1 - 19, text=txt,
-                          fill=theme.warn, font=self.font_mini)
+    def _draw_warn(self, vx0, vy0, vx1, vy1):
+        """竖排低比例警示牌（UI 改进 B9，由状态栏文案改到画布角落；tag `warnbox`）。
 
-        # ---- 6) 小传浮卡（重挂回来；Canvas 的 delete("all") 只删图元，不销毁内嵌控件）----
-        self._rehang_popcard()
+        实测：竖排铭牌（卡高 54→**60**，2026-09-26 与代际家谱统一后复测：
+        3.0~6.0 px/年 直斜线全为 0，4.4 这个阈值继续沿用，只是更保守）；
+        更低时卡片把水平空白巷道挤没了，会有几十条连线只能从卡上压过去（几何必然）。
+        """
+        if self.plate != "v" or self.scale >= V_PLATE_MIN_SCALE:
+            return
+        c, theme = self.canvas, self.theme
+        # ★ 2026-10-06 修「警示牌文字被画布右缘裁掉」（UI 审计，铁律②）：
+        #   原来框宽写死 260，文字 `create_text` 无宽度约束 —— `font_mini`
+        #   在高 DPI 下实际渲染宽超过 260 ⇒ 右半截顶出画布被裁（截图实证）。
+        #   改为**按字体实测宽度定框宽**（铁律②的正确顺序：加宽，不裁字）；
+        #   文案同步去掉准则禁用的「·」。
+        txt = "竖排铭牌在此缩放下部分连线绕不开，放大或换横排"
+        tw = max(260, self.font_mini.measure(txt) + 24)
+        bx1 = vx1 - 8
+        bx0 = bx1 - tw
+        c.create_rectangle(bx0, vy1 - 30, bx1, vy1 - 8,
+                           fill=theme.bg_card, outline=theme.warn, width=1,
+                           tags=("warnbox",))
+        c.create_text((bx0 + bx1) // 2, vy1 - 19, text=txt,
+                      fill=theme.warn, font=self.font_mini, tags=("warnbox",))
+
+    def _raise_layers(self):
+        """统一提层（与画序无关，从底到顶依次 raise，后 raise 的在最上）。
+
+        ★★ 2026-10-04 使用者要求：「**无论是铭牌之间连线还是世系框的线，
+        都不要盖住任何字，但是高亮的时候可以**」——
+        原来「线画在卡片之下就被卡遮住」的前提，随 2026-10-04 铭牌底色改
+        **透明**而不复存在（线全部透出来压在字上）。现在靠提层兜底：
+        最终层序（底→顶）＝ 世系框 `sbox` → 静态连线 `tlinks` → 框题
+        `sboxtitle` → 卡框 `platebg` → 端点 `enddots` → **铭牌文字
+        `platetext`（最顶：任何静态线都压不到字上）** → 警示牌 `warnbox`
+        → 小传浮卡 `popcard`。悬停/选中等**高亮**样式不走这里，照旧。
+        """
+        for t in ("sbox", "tlinks", "sboxtitle", "platebg",
+                  "enddots", "platetext", "warnbox"):
+            try:
+                self.canvas.tag_raise(t)
+            except Exception:
+                pass
+        try:
+            self.canvas.tag_raise("popcard")      # 浮卡永远最顶
+        except Exception:
+            pass
+
+    # ================================================================ 按需补画（T1/T2）
+    def _schedule_paint(self, delay=15):
+        """安排一次「分帧补画」—— 每帧预算 12ms，画不完下帧继续（T2）。
+
+        ★ 为什么分帧：这台机器上全视口重画 ≈850ms（中文文字光栅化 ~2ms/块），
+        一帧画太多 item 的 dirty 区域就会大到掉帧。每帧只画一小批，
+        dirty = 该批覆盖的小区域 ⇒ 每帧 <16ms，视觉是内容渐进浮现。
+        ⚠️ `TimelineView` 是普通对象 —— 必须走 `canvas.after`（与
+        tree_view._schedule_paint 同一条踩坑记录）。
+        """
+        if getattr(self, "_paint_job", None) is not None:
+            return
+        if getattr(self, "_grab_id", None) is not None:
+            return                            # 快照模式：真 items 不参与，松手再补
+        self._paint_job = self.canvas.after(delay, self._paint_step)
+
+    def _paint_step(self):
+        self._paint_job = None
+        if getattr(self, "_grab_id", None) is not None:
+            # 快照模式：真 items 绝不画（残留的泵会在快照图上叠画卡片）
+            self._paint_steps = None
+            return
+        # ★ 队列「None 或跑尽的 []」都要重建 —— 残留 [] 会让补画永远空转
+        if not self._paint_steps:
+            self._paint_steps = self._build_paint_steps()
+            if not self._paint_steps:
+                self._drop_grab_underlay()    # 没活干也要把垫底图放掉
+                self._tile_enqueue_ring()     # 顺手排一圈瓦片预铺
+                self._tile_prefetch_soon()
+                return
+        t0 = time.perf_counter()
+        while self._paint_steps and time.perf_counter() - t0 < 0.012:
+            step = self._paint_steps.pop(0)
+            try:
+                step()
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "时间轴补画分帧步骤失败：%r", e)
+        if self._paint_steps:
+            self._paint_job = self.canvas.after(15, self._paint_step)
+        else:
+            self._paint_steps = None          # 干完清队（下次重新 build）
+            self._drop_grab_underlay()        # 真 items 补齐 —— 垫底图退役
+            self._tile_enqueue_ring()         # 空下来了 —— 预铺周边瓦片
+            self._tile_prefetch_soon()
+
+    def _build_paint_steps(self):
+        """把一次「视口补齐」拆成小步闭包队列（T2 分帧）。
+
+        顺序 = 淘汰出界卡 → 补新卡（每 ~6 张一步）→ 连线 → 端点 →
+        年格线 → 世系框 → 朝代带 → 警示牌。每步自身都很小，几步凑满一帧。
+        """
+        steps = []
+        if not self._ready:
+            return steps
+        c = self.canvas
+        lay = self.lay
+        pos = lay.positions
+        vw, vh = self._viewport()
+        vx0, vy0 = c.canvasx(0), c.canvasy(0)
+        vx1, vy1 = vx0 + vw, vy0 + vh
+        pad_x, pad_y = vw * 0.5, vh * 0.5
+        x0, y0, x1, y1 = vx0 - pad_x, vy0 - pad_y, vx1 + pad_x, vy1 + pad_y
+
+        # ---- 步 1：淘汰走远的卡片（线 tag 带两端人名，随人一并删）----
+        gone = [n for n in self._drawn_people
+                if not (x0 <= pos[n][0] <= x1 and y0 <= pos[n][1] <= y1)]
+
+        def _evict():
+            for n in gone:
+                try:
+                    c.delete(f"p_{n}")
+                except Exception:
+                    pass
+                self._drawn_people.discard(n)
+        if gone:
+            steps.append(_evict)
+
+        # ---- 步 2..N：补画新进视口的卡片（每 ~6 张一步，由中心向外）----
+        todo = [n for n, (x, y) in pos.items()
+                if x0 <= x <= x1 and y0 <= y <= y1 and n not in self._drawn_people]
+        if todo:
+            cx, cy = (vx0 + vx1) / 2.0, (vy0 + vy1) / 2.0
+            todo.sort(key=lambda n: abs(pos[n][0] - cx) + abs(pos[n][1] - cy))
+            for i in range(0, len(todo), 6):
+                batch = todo[i:i + 6]
+
+                def _cards(batch=batch):
+                    for n in batch:
+                        self._draw_card(n, pos[n][0], pos[n][1], lay.widths[n])
+                        self._drawn_people.add(n)
+                steps.append(_cards)
+
+        # ---- 本屏卡片（状态栏口径，与 redraw 的卡片判定一致）----
+        chh = lay.card_h
+        drawn = []
+        for name, (x, y) in pos.items():
+            if y < vy0 - chh or y > vy1:
+                continue
+            w = lay.widths[name]
+            if x + w / 2 < vx0 or x - w / 2 > vx1:
+                continue
+            drawn.append((x, y, w))
+
+        # ---- 后续轻量层（每层一步；格线/框已按视口裁剪，单层 dirty 小）----
+        ends_holder = []
+
+        def _links():
+            ends_holder.append(self._draw_links(vx0, vy0, vx1, vy1))
+        steps.append(_links)
+
+        def _enddots():
+            self._draw_enddots(ends_holder[0] if ends_holder else [],
+                               drawn, vx0, vy0, vx1, vy1)
+        steps.append(_enddots)
+        steps.append(lambda: self._draw_grid(vx0, vy0, vx1, vy1))
+        steps.append(lambda: self._draw_state_boxes(vx0, vy0, vx1, vy1))
+        steps.append(lambda: self._draw_warn(vx0, vy0, vx1, vy1))
+        steps.append(lambda: self._draw_rail())
+
+        def _count():
+            self._visible_count = len(drawn)
+            self._rehang_popcard()    # 快照模式 delete("all") 撤过浮卡图元
+            self._raise_layers()
+        steps.append(_count)
+        return steps
+
+    def _paint_viewport(self):
+        """兼容入口：一次排完整个补画队列（等价旧语义，分帧执行）。"""
+        self._paint_steps = None
+        self._schedule_paint()
+
+    # ================================================================ 快照贴图（T2）
+    def _grab_start(self):
+        """进入快照模式：真 items 全部换成一张视口位图（拖动/滚动期间）。
+
+        失败降级（无 PIL / PrintWindow 失败）→ 返回 False，调用方走原路
+        （平移 + 分帧补画），不挡功能。
+        """
+        if self._grab_id is not None or getattr(self, "_grab_busy", False):
+            return True
+        if not self._ready:
+            return True
+        self._grab_busy = True
+        try:
+            from .. import wincap
+            from PIL import Image, ImageTk
+            # 上一次补画泵若还在跑，先停 —— 否则真 items 会一张张叠画到
+            # 快照图上（拖动闪现根源之一）；松手后 _grab_end 会重新安排。
+            if getattr(self, "_paint_job", None) is not None:
+                try:
+                    self.canvas.after_cancel(self._paint_job)
+                except Exception:
+                    pass
+                self._paint_job = None
+            self._paint_steps = None
+            # 滚轮路径残留的自动恢复定时器：不撤会在本次拖动中途触发
+            # _grab_end（图被拆 → 闪现/抖动）
+            if self._grab_release_job is not None:
+                try:
+                    self.canvas.after_cancel(self._grab_release_job)
+                except Exception:
+                    pass
+                self._grab_release_job = None
+            w, h, bgra = wincap.capture_widget_region(self.canvas)
+            img = Image.frombuffer("RGBA", (w, h), bgra, "raw", "BGRA").convert("RGB")
+            self._grab_photo = ImageTk.PhotoImage(img)
+            c = self.canvas
+            vx0, vy0 = c.canvasx(0), c.canvasy(0)
+            c.delete("all")                       # 真 items 全撤（补画队列稍后重建）
+            self._drop_grab_underlay()            # 旧垫底图已随 delete("all") 移除，清引用
+            self._drawn_people = set()
+            # 瓦片环：预渲染的周边底图钉上（±1 屏内拖动 = 拖图不露纸底）
+            self._tile_attach(c, vx0, vy0,
+                              max(c.winfo_width(), 50), max(c.winfo_height(), 50))
+            self._grab_id = c.create_image(vx0, vy0, image=self._grab_photo,
+                                           anchor="nw", tags=("grab",))
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).warning("快照模式启动失败，走原路：%r", e)
+            self._grab_id = None
+            self._grab_photo = None
+            return False
+        finally:
+            self._grab_busy = False
+
+    def _grab_move(self):
+        """快照模式下视口变了 —— 同步代数条/缩略条；快照图**不**跟挪
+        （保持钉在抓取时的文档坐标上），内容才能随拖动自然平移，超出
+        快照的边缘露纸底，松手分帧补全。
+
+        ★ 2026-10-05 修「幽灵菜单栏」时一并改：原实现每步把图重新钉到
+        新视口左上角，拖动全程画面静止；且当时贴的是整窗截图（GA_ROOT），
+        左半就是菜单栏的幽灵。
+        """
+        if self._grab_id is None:
+            return
+        c = self.canvas
+        self.rail.yview_moveto(c.yview()[0])
+        self._sync_mini()
+
+    def _grab_end(self):
+        """退出快照模式：图**不删**，转为垫底（underlay）→ 分帧补画真 items
+        画在垫底图上方（同坐标同样式，画上即重合，肉眼零变化），补画跑完
+        `_paint_step` 才删垫底图。
+
+        ★ 2026-10-05 修「拖动以后抖动」：原来松手即删图 → 瓦片式补画逐步
+          拼回（卡片成批浮现、格线/世系框/朝代带最后出现）≈1 秒的反复重组
+          看起来就是抖。垫底方案下松手瞬间画面与拖动中完全一致。
+        """
+        self._grab_dragging = False
+        if self._grab_release_job is not None:
+            try:
+                self.canvas.after_cancel(self._grab_release_job)
+            except Exception:
+                pass
+            self._grab_release_job = None
+        if self._grab_id is None:
+            return
+        self._grab_underlay = self._grab_id
+        self._grab_underlay_photo = self._grab_photo   # 转 ref 防 GC（图元还引用着）
+        self._grab_id = None
+        self._grab_photo = None
+        self.canvas.delete("tile")        # 瓦片图元撤下（照片留在缓存供下次拖动）
+        self._schedule_paint()                    # 分帧重建（画在垫底图上方）
+
+    def _drop_grab_underlay(self):
+        """垫底图使命结束（补画跑尽/重新进快照）—— 删图清引用。"""
+        if getattr(self, "_grab_underlay", None) is not None:
+            try:
+                self.canvas.delete(self._grab_underlay)
+            except Exception:
+                pass
+        self._grab_underlay = None
+        self._grab_underlay_photo = None
+
+    def _grab_arm_auto(self, delay=300):
+        """滚轮/滚动条路径：停顿 delay 毫秒后自动退出快照模式。
+
+        ★ 按住拖动中**绝不**自动退出 —— 拖动停顿超 300ms 就拆快照渐进
+          重画、手一动又重抓（delete("all") → 贴图），就是「拖动闪现」。
+        """
+        if getattr(self, "_grab_dragging", False):
+            return
+        if self._grab_release_job is not None:
+            try:
+                self.canvas.after_cancel(self._grab_release_job)
+            except Exception:
+                pass
+        self._grab_release_job = self.canvas.after(delay, self._grab_end)
+
+    # ------------------------------------------------ 拖动底图瓦片（TileRing 钩子）
+    def _tile_root(self):
+        return self.master.root
+
+    def _tile_grid(self):
+        """瓦片 = 半个视口（单块 ≈70ms，预铺泵 25ms 一块，肉眼无感）。"""
+        vw = max(self.canvas.winfo_width(), 50)
+        vh = max(self.canvas.winfo_height(), 50)
+        return max(vw // 2, 200), max(vh // 2, 200)
+
+    def _tile_region(self):
+        lay = self.lay
+        return (0, 0, lay.width, lay.height)
+
+    def _tile_paint(self, cv, x0, y0, tw, th):
+        """在影子画布上画一块瓦片 —— 临时「换台」：绘图代码全走 self.canvas，
+        账本换成草稿，画完还原（同 tree_view._tile_paint 的套路）。"""
+        if not self._ready or self.lay is None:
+            return
+        saved = (self.canvas, self._drawn_people, self.selected, self._grab_id)
+        self.canvas = cv
+        self._drawn_people = set()
+        self.selected = None              # 瓦片不烙选中高亮（高亮是交互层）
+        self._grab_id = "tile"            # 哨兵：_schedule_paint 见它就退
+        try:
+            vw, vh = cv.winfo_width(), cv.winfo_height()
+            vx1, vy1 = x0 + vw, y0 + vh
+            lay = self.lay
+            pos = lay.positions
+            drawn = []                    # 本屏卡片（端点用，口径同 _build_paint_steps）
+            for name, (x, y) in pos.items():
+                if y < y0 - lay.card_h or y > vy1:
+                    continue
+                w = lay.widths[name]
+                if x + w / 2 < x0 or x - w / 2 > x0 + vw:
+                    continue
+                drawn.append((x, y, w))
+            pad_x, pad_y = vw * 0.5, vh * 0.5
+            xa, ya, xb, yb = x0 - pad_x, y0 - pad_y, vx1 + pad_x, vy1 + pad_y
+            for n, (x, y) in pos.items():
+                if xa <= x <= xb and ya <= y <= yb:
+                    self._draw_card(n, x, y, lay.widths[n])
+            ends = self._draw_links(x0, y0, x0 + vw, y0 + vh)
+            self._draw_enddots(ends, drawn, x0, y0, x0 + vw, y0 + vh)
+            self._draw_grid(x0, y0, x0 + vw, y0 + vh)
+            self._draw_state_boxes(x0, y0, x0 + vw, y0 + vh)
+            self._draw_warn(x0, y0, x0 + vw, y0 + vh)
+            self._raise_layers()
+        finally:
+            (self.canvas, self._drawn_people, self.selected, self._grab_id) = saved
 
     # ================================================================ 小传浮卡
     def hide_popcard(self):
@@ -901,7 +1561,9 @@ class TimelineView:
         name = self.selected
         if not name or not self._ready or name not in self.lay.positions:
             return
-        built = build_popcard(self.canvas, self.theme, self.master.people, name)
+        # app=self.master ⇒ 同树视图：补「年龄 / 余寿」（取自实录层 Profile）
+        built = build_popcard(self.canvas, self.theme, self.master.people, name,
+                              app=self.master)
         if built is None:
             return
         card, w, h = built
@@ -1078,9 +1740,13 @@ class TimelineView:
         y = self.lay.y_of(year - half)
         total = max(self.lay.height, 1)
         self.canvas.yview_moveto(max(0.0, min(1.0, y / total)))
-        self.rail.yview_moveto(self.canvas.yview()[0])
-        self.redraw()
-        self._sync_mini()          # 拖动绿框 / 点缩略条：绿框跟着走到新位置
+        if self._grab_id is not None or self._grab_start():
+            self._grab_move()          # T2：拖全览绿框也走快照贴图
+            self._grab_arm_auto()
+        else:
+            self.rail.yview_moveto(self.canvas.yview()[0])
+            self._schedule_paint()
+        self._sync_mini()              # 拖动绿框 / 点缩略条：绿框跟着走到新位置
 
     # ================================================================ 滚动
     def _touch(self):
@@ -1090,14 +1756,22 @@ class TimelineView:
     def _yview(self, *args):
         self._touch()
         self.canvas.yview(*args)
-        self.rail.yview_moveto(self.canvas.yview()[0])
-        self.redraw()
-        self._sync_mini()
+        if self._grab_id is not None or self._grab_start():
+            self._grab_move()          # T2：快照贴图，重画 = 1 image
+            self._grab_arm_auto()      # 停顿 300ms 自动恢复真 items
+        else:
+            self.rail.yview_moveto(self.canvas.yview()[0])
+            self._schedule_paint()
+            self._sync_mini()
 
     def _xview(self, *args):
         self._touch()
         self.canvas.xview(*args)
-        self.redraw()
+        if self._grab_id is not None or self._grab_start():
+            self._grab_move()
+            self._grab_arm_auto()
+        else:
+            self._schedule_paint()
 
     def _on_yscroll(self, first, last):
         self.vbar.set(first, last)
@@ -1120,17 +1794,32 @@ class TimelineView:
         self._draw_mini_viewbox()
 
     def _on_wheel(self, event):
+        # ★ 2026-10-11：守卫原来只看 `_grab_dragging`（要超 4px 阈值才置真）——
+        #   按下后没拖够 4px 时滚轮**照滚** ⇒ scan 锚失效 ⇒ 下一步反向回退。
+        #   `_drag_view` 在**按下**就置了 ⇒ 用它当「左键按住中」的判据。
+        if self._drag_view is not None or getattr(self, "_grab_dragging", False):
+            return "break"                    # 按住拖动中：忽略滚轮（防轨迹回拽）
         self._touch()
         self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
-        self.rail.yview_moveto(self.canvas.yview()[0])
-        self.redraw()
-        self._sync_mini()
+        if self._grab_id is not None or self._grab_start():
+            self._grab_move()          # T2：滚轮也走快照贴图
+            self._grab_arm_auto()
+        else:
+            self.rail.yview_moveto(self.canvas.yview()[0])
+            self._schedule_paint()
+            self._sync_mini()
         return "break"
 
     def _on_wheel_shift(self, event):
+        if self._drag_view is not None or getattr(self, "_grab_dragging", False):
+            return "break"                    # 按住拖动中：忽略滚轮（防轨迹回拽）
         self._touch()
         self.canvas.xview_scroll(int(-event.delta / 120) * 3, "units")
-        self.redraw()
+        if self._grab_id is not None or self._grab_start():
+            self._grab_move()
+            self._grab_arm_auto()
+        else:
+            self._schedule_paint()
         return "break"
 
     def _on_wheel_ctrl(self, event):
@@ -1169,7 +1858,16 @@ class TimelineView:
             self.master.on_layout_changed()
             return
         self._draw_mini()
-        self.redraw()
+        # ★ T1/T2：resize 不全量重绘（拖窗口边缘会连发 Configure）——
+        #   先退出快照（快照尺寸已不符），再去抖 120ms 分帧补画。
+        self._tiles_bump()                # 瓦片尺寸跟着视口走，全部作废
+        self._grab_end()
+        if self._resize_job is not None:
+            try:
+                self.canvas.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.canvas.after(120, self._paint_step)
         self.master.on_layout_changed()
 
     # ================================================================ 鼠标
@@ -1186,6 +1884,9 @@ class TimelineView:
 
     def _on_click(self, event):
         self._press = (event.x, event.y, self.canvas.canvasx(0), self.canvas.canvasy(0))
+        self._scan_ok = False                    # 本次手势的 scan 锚还没打
+        # ★ 2026-10-11：手势开始 —— 记视口，供 `_on_drag` 的锚失效看门狗比对
+        self._drag_view = (self.canvas.canvasx(0), self.canvas.canvasy(0))
         name = self._hit(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
         if name:
             self.master.select_person(name)
@@ -1193,22 +1894,55 @@ class TimelineView:
             self.master.clear_selection()
 
     def _on_drag(self, event):
-        """拖动空白 = 平移（不依赖 scan_dragto，因为我改了 scrollregion 的用法）。"""
+        """拖动空白 = 平移。
+
+        ★ 2026-10-04 T2：平移走**快照贴图** —— Tk Canvas 滚动没有位图优化，
+        每次平移都是全视口重画（本机 ≈850ms，中文文字光栅化），真 items
+        必卡；换成 1 张视口位图后每步 ≈15ms。超阈值才抓快照（按下不拖 =
+        单击选中，不出图）。快照启动失败则降级走「平移 + 分帧补画」。
+        ★ 2026-10-05 平移改 **scan_mark/scan_dragto**（Tk 自带的指针锚平移）：
+          自算增量锚（`_last_drag_xy`）依赖 `_on_click` 更新锚点 —— 实测第二次
+          按下时点击处理可能不执行（探针复现），锚点残留上一轮 ⇒ 每轮拖动
+          都从上一轮的轨迹起点重走一遍 = 使用者看到的「恢复原位」。
+          scan 锚在**首次 motion 时就地补打**（`_scan_ok` 门），不依赖 press
+          是否送达 —— 锚点永远取当前指针位置，旧锚残留从根上消失。
+        """
         if not self._ready:
             return
+        px, py, _cx0, _cy0 = self._press
+        if abs(event.x - px) < 4 and abs(event.y - py) < 4:
+            return                            # 还没超出点击阈值
         self._touch()
-        px, py, cx0, cy0 = self._press
-        dx, dy = event.x - px, event.y - py
-        total_w = max(self.lay.width, 1)
-        total_h = max(self.lay.height, 1)
-        vw, vh = self._viewport()
-        nx = max(0.0, min(1.0, (cx0 - dx) / total_w))
-        ny = max(0.0, min(1.0, (cy0 - dy) / total_h))
-        self.canvas.xview_moveto(nx)
-        self.canvas.yview_moveto(ny)
-        self.rail.yview_moveto(self.canvas.yview()[0])
-        self.redraw()
-        self._sync_mini()          # 拖画布平移：绿框要跟着走
+        self._grab_dragging = True            # 按住拖动中：停顿也不拆快照
+        # ★★ 2026-10-11 使用者（第 3 条）：「拖动时仍然出现**半路回退式**抖动」。
+        #   根因（代际 tree_view 同步修，探针 `_scratch/_probe_jitter3.py` 实测）：
+        #   scan 锚是**一次性**的 —— 任何**非本手势**的视口位移（滚轮/滚动条/
+        #   程序性跳转）都会让它失效，下一个 motion 就会去「追」旧锚 = 反向回退。
+        #   ⇒ 锚失效看门狗：视口与上一步记录不符就地重打锚，一次兜住所有外部滚动。
+        _v = (self.canvas.canvasx(0), self.canvas.canvasy(0))
+        if self._drag_view is not None and self._drag_view != _v:
+            self.canvas.scan_mark(event.x, event.y)
+            self._scan_ok = True
+        if self._grab_id is None:
+            self._grab_start()                # 失败内部已置空，走降级路径
+        if not getattr(self, "_scan_ok", False):
+            self.canvas.scan_mark(event.x, event.y)   # 就地补锚（当前指针）
+            self._scan_ok = True
+        self.canvas.scan_dragto(event.x, event.y, gain=1)
+        self._drag_view = (self.canvas.canvasx(0), self.canvas.canvasy(0))
+        if self._grab_id is not None:
+            self._grab_move()                 # 重画 = 1 张 image，快
+        else:
+            self.rail.yview_moveto(self.canvas.yview()[0])
+            self._sync_mini()                 # 绿框跟着走（内容等松手后补）
+        self._schedule_paint()                # 兜底：松手后分帧重建
+
+    def _on_release(self, event):
+        """松手 = 退出快照模式，分帧补画真实 items（渐进浮现）。"""
+        self._grab_dragging = False
+        self._scan_ok = False
+        self._drag_view = None                # 手势结束（看门狗停摆）
+        self._grab_end()
 
     def _on_double(self, event):
         name = self._hit(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
@@ -1237,6 +1971,7 @@ class TimelineView:
         self._touch()
         self.scale = scale
         self._user_zoomed = True
+        self._tiles_bump()                # 比例尺换代，瓦片作废
         if self._zoom_job is not None:
             self.canvas.after_cancel(self._zoom_job)
         self._zoom_job = self.canvas.after(90, self._apply_zoom)
@@ -1280,6 +2015,18 @@ class TimelineView:
             self.set_scale(self.scale * (1.3 if direction > 0 else 1 / 1.3))
         return self.scale
 
+    def _zoom(self):
+        """**归一化缩放**（默认缩放下 = 1.0；范围约 0.61~3.0）。
+
+        ⚠️ 为什么必须有这个函数（2026-10-04 因此写炸过两处线宽）：
+          本视图 `self.scale` 的单位是 **px/年**（`SCALE_DEFAULT = 4.0`，
+          范围 2.43~12.0）；而**代际家谱**的 `self.scale` 是**布局倍数**
+          （默认 1.06，范围 0.40~2.66）。**两者差 4 倍以上、语义完全不同** ✗。
+          所以任何"参考代际"的线宽 / 线距参数，都必须先除以本视图的默认值
+          归一化再用 —— 否则算出来会粗一至十倍（世系框曾因此变成"一排方块"）。
+        """
+        return self.scale / T.SCALE_DEFAULT
+
     def zoom_percent(self):
         return round(self.scale / T.SCALE_DEFAULT * 100)
 
@@ -1313,21 +2060,22 @@ class TimelineView:
         vw, vh = self._viewport()
         total_w = max(self.lay.width, 1)
         total_h = max(self.lay.height, 1)
+        self._grab_end()               # 大幅跳转：旧快照作废（内容已是别处）
         self.canvas.xview_moveto(max(0.0, min(1.0, (x - vw / 2) / total_w)))
         self.canvas.yview_moveto(max(0.0, min(1.0, (y - vh / 2) / total_h)))
         self.rail.yview_moveto(self.canvas.yview()[0])
-        self.redraw()
+        self._schedule_paint()         # 目标区从第一帧就渐进浮现
 
     def status_text(self):
         """状态栏中间那段（视口年份 + 比例尺 + 本屏人数）。"""
         if not self._ready:
-            return "时间轴 · 无生年数据"
+            return "时间轴 ｜ 无生年数据"
         vw, vh = self._viewport()
         ya = self.lay.year_at(self.canvas.canvasy(0))
         yb = self.lay.year_at(self.canvas.canvasy(0) + vh)
         n = getattr(self, "_visible_count", 0)
-        txt = (f"视口 {_fmt_year(int(ya))} ~ {_fmt_year(int(yb))} · "
-               f"{self.scale:.2f} px/年 · 本屏 {n} 人 · "
+        txt = (f"视口 {_fmt_year(int(ya))} ~ {_fmt_year(int(yb))} ｜ "
+               f"{self.scale:.2f} px/年 ｜ 本屏 {n} 人 ｜ "
                f"全档 {len(self.lay.years)} 人有生年")
         # UI 改进 B9：竖排低比例警告已改画在画布右下角（redraw 第 5.5 步），
         # 状态栏不再拖一句尾巴。

@@ -178,7 +178,11 @@ class ShiguanApp:
                                     .get("nohist", False))
         self.hide_dead = bool((self.cfg.get("filter_state") or {}).get("dead", False))
         self._branch_only = bool((self.cfg.get("filter_state") or {}).get("branch", False))
-        self.focused = []                 # 选定名单（按谱牒存，见上）
+        self.focused = []                 # 关注名单（按谱牒存，见上）
+        # ★ 2026-10-04 使用者裁定：**高亮只认手动选定**（`selected`），
+        #   「关注」被公卿自动关注批量写满（700+），不能兼任高亮。
+        #   后裔仍按 `focus_set()` 展开 ⇒ 「后裔也默认选定、也要显示」。
+        self.selected = []                # 手动选定名单（按谱牒存）
         self.unfocused = []               # ★ 取消关注名单（按谱牒存，见 storage.CANVAS_KEYS）
         self._focus_set_cache = None      # 高亮集合缓存（见 focus_set）
         self._focus_set_key = None        # 缓存对应的 people 身份（换档自动重算）
@@ -453,6 +457,8 @@ class ShiguanApp:
                         if n in self.people]
         self.unfocused = [n for n in (st.get("unfocused") or [])
                           if n in self.people]
+        self.selected = [n for n in (st.get("selected_people") or [])
+                         if n in self.people]
         self.hidden_non_historical = {n: True
                                       for n in (st.get("hidden_non_historical") or [])
                                       if n in self.people}
@@ -466,6 +472,7 @@ class ShiguanApp:
             storage.write_save(
                 self.current_save, self.people, self.cutoff_person,
                 canvas={"focused_people": list(self.focused),
+                        "selected_people": list(self.selected),
                         "unfocused": list(self.unfocused),
                         "hidden_non_historical": [k for k, v in
                                                   self.hidden_non_historical.items() if v]})
@@ -1154,7 +1161,7 @@ class ShiguanApp:
             # 一打开会看到空画布，不说明会以为坏了。
             if self.enrolled_only and not self.enrolled_set():
                 self.statusbar.set(
-                    "hint", "画布为空 · 人物页点「入谱」或「加入族谱」即上画布")
+                    "hint", "画布为空 ｜ 人物页点「入谱」或「加入族谱」即上画布")
         except Exception:
             pass
         try:
@@ -1494,13 +1501,13 @@ class ShiguanApp:
         #   使用者裁定落状态栏，就是因为它这一条放得下整句、不会被挤断。
         if self.tree is not None and self.tree.lay is not None:
             lay = self.tree.lay
-            sb.set("gen", f"谱内 {len(self.people)} 人 · 根节点 {len(lay.roots)} · "
+            sb.set("gen", f"谱内 {len(self.people)} 人 ｜ 根节点 {len(lay.roots)} ｜ "
                           f"可见 {lay.min_depth}–{lay.max_depth} 代")
         elif self.timeline is not None and self.timeline.lay is not None:
             tl = self.timeline
-            sb.set("gen", f"{tl.status_text()} · 连线 {len(tl.lay.link_pairs)} 条")
+            sb.set("gen", f"{tl.status_text()} ｜ 连线 {len(tl.lay.link_pairs)} 条")
         elif self.table is not None:
-            sb.set("gen", f"谱牒 {len(self.people)} 行 · 显示 {len(self.table.rows)} 行")
+            sb.set("gen", f"谱牒 {len(self.people)} 行 ｜ 显示 {len(self.table.rows)} 行")
         else:
             sb.set("gen", self._view_gen_text())
         rec = self.record_slot.name if self.record_slot else "未载入"
@@ -2076,7 +2083,7 @@ class ShiguanApp:
     def _set_search_hint(self, total):
         if self.tree is not None and self.tree.search_hits:
             idx = self.tree.search_index + 1
-            self.statusbar.set("hint", f"命中 {total} 人 · 第 {idx} 个 · 回车下一个")
+            self.statusbar.set("hint", f"命中 {total} 人 ｜ 第 {idx} 个 ｜ 回车下一个")
         else:
             self.statusbar.set("hint", f"命中 {total} 人 · 回车下一个")
 
@@ -2276,8 +2283,10 @@ class ShiguanApp:
                 d = (v or {}).get("father", "") or ""
                 if d:
                     kids.setdefault(d, []).append(n)
-            out = set(self.focused)
-            stack = list(self.focused)
+            # ★ 2026-10-04：种子改为**手动选定名单** —— 公卿自动关注写满的
+            #   `focused`（700+）不再触发高亮；后裔展开不变（「后裔也默认选定」）。
+            out = set(self.selected)
+            stack = list(self.selected)
             while stack:
                 cur = stack.pop()
                 for c in kids.get(cur, ()):
@@ -2331,6 +2340,21 @@ class ShiguanApp:
             self._enrolled_cache = None
         return n, ""
 
+    def _sync_selected(self, person):
+        """把「本次手动操作」同步进 `self.selected`（**高亮只认这张名单**）。
+
+        ★ 2026-10-04 使用者：「三A 只高亮手动选定的人，可以，但是**后裔也默认选定**，
+          就是也要显示」。⇒ 高亮的**触发源**只能是**手动**（右键选定 / 取消），
+          公卿自动关注批量写进 `focused` 的那 700 人**不再**触发高亮；
+          一旦某人被手动选定，`focus_set()` 仍会把他**全部男性后裔**一并纳入
+          （「后裔也默认选定」）。两个名单都按谱牒持久化，互不覆盖。
+        """
+        if person in self.focused:
+            if person not in self.selected:
+                self.selected.append(person)
+        elif person in self.selected:
+            self.selected.remove(person)
+
     def toggle_focus(self, person, code=""):
         """右键「关注/取消关注」：把某人加进/移出「仅显关注」名单（可多选）。
 
@@ -2347,6 +2371,7 @@ class ShiguanApp:
                     self.unfocused.append(person)   # 记忆取消，自动关注不再回加
                 self.statusbar.set("hint",
                     f"已取消关注 {person}（余 {len(self.focused)} 人）")
+                self._sync_selected(person)
                 self._persist_canvas_state()
             else:
                 # ⚠️ 顺序要紧：**先**写档、**后**落名单。
@@ -2362,6 +2387,7 @@ class ShiguanApp:
                 self.statusbar.set(
                     "hint", f"已关注 {person}（实录层 · 共 {len(self.focused)} 人"
                             f"；{tail}）")
+                self._sync_selected(person)
                 self._persist_canvas_state()
             self._focus_set_cache = None   # 名单变了，高亮集合缓存必须重算
             return
@@ -2381,6 +2407,7 @@ class ShiguanApp:
                 "hint", f"已关注 {person}（共 {len(self.focused)} 人"
                         f"；勾「仅显关注」生效）{extra}")
         self._focus_set_cache = None      # 名单变了 → 高亮集合重算
+        self._sync_selected(person)       # ★ 手动名单同步（高亮只认它）
         self._persist_canvas_state()      # ★ 名单按谱牒存（原来写 config 会串档）
         if self.focus_only:
             self._refresh_all()
@@ -2500,8 +2527,39 @@ class ShiguanApp:
         for c in roots:
             if c in by_code:
                 need |= set(IM._male_line(by_code, c))
+        # ★ 2026-10-07 使用者（续七十二）：「**韩广类比韩淑，他俩一样的逻辑，
+        #   加入关注**」—— 韩淑是「秦国韩氏」卿室家主 ⇒ 本就被「家族成员」判据
+        #   收进来了；**韩广不在任何家族的成员表里**（游戏没给他家族边），却同样
+        #   是秦帝（`King_Str` 第二条）⇒ 只按家族成员永远收不到他。
+        #   ⇒ 补一条：**国君（`King_Str` 历代君主）一并关注＋入谱**（存档原文，不猜）。
+        #   实测本档命中 11 人（姒摇/将闾/熊心/嬴胡亥/嬴子婴/李由/丁恽/伶涓/
+        #   龙且/韩广/乐正克）。放在 `_male_line` 展开**之后**，免得为君主再展开
+        #   一整支父系后裔（那是「家族成员」判据的事）。
+        _and_rc = {str(f.get("king_code")) for f in fams
+                   if f.get("king_code") is not None}
+        _rcodes = {str((self.people.get(n) or {}).get("code") or "")
+                   for n in GQ.ruler_names(self.record_slot, _and_rc)}
+        _rcodes = {c for c in _rcodes
+                   if c and code2name.get(c) not in self.unfocused}
+        _ruler_add = len(_rcodes - roots)
+        roots |= _rcodes
+        need |= _rcodes
         if not need:
             return _say("公卿家族没有可在存档里对上的人")
+
+        # ★ 2026-10-05 使用者裁定：宗室填充人**连谱牒都不进**——《大宋天下》
+        #   实测：续四十一版过滤只挡了「关注/入谱标」，`need` 里仍带着他们 ⇒
+        #   整批导入 ⇒ 画布上照旧浮出孤点（「隐藏非史」一关就现形）。
+        #   ⇒ 导入**之前**就从 need 里剔除（判据唯一实现 `GQ.filler_codes`）；
+        #     **君主例外**照旧：现任君主即便无家族边也要导入（关注环节由
+        #     `filler_exception` 挂靠前任）。
+        _fillers = GQ.filler_codes(by_code, members=need)
+        _ruler_codes = {str(r.get("code")) for r in GQ.rulers(self.record_slot)}
+        _fillers -= _ruler_codes
+        if _fillers:
+            need -= _fillers
+        if not need:
+            return _say("公卿家族成员都是无家族边的宗室填充人，没有可关注的")
 
         rc, _a, _u = IM.import_codes(src, sorted(need), self.current_save,
                                      by_code=by_code)
@@ -2511,11 +2569,58 @@ class ShiguanApp:
         self.load_data()
 
         # 家族成员 → 关注名单；本人 + 父系后裔 → 「入谱」标（同一次落盘）
-        added, focused_add = 0, 0
+        # ★ 2026-10-04 使用者裁定：**宗室填充人**（新封建/开局诸侯国被游戏塞进
+        #   来的 3-5 个无父母、无配偶、无子女的孤立节点，用于避免诸侯绝嗣）
+        #   **男女都不要**自动关注/入谱——判据=在谱内没有任何家族边；日后
+        #   游戏事件让他成婚/生子（有了边），下一次自动关注自然会带上。
+        _has_child = set()
+        for _v in self.people.values():
+            for _k in ("father", "mother"):
+                _p = (_v or {}).get(_k)
+                if _p:
+                    _has_child.add(_p)
+        added, focused_add, filler_skip, filler_king, lone_skip = 0, 0, 0, 0, 0
         for nm, v in self.people.items():
             c = str((v or {}).get("code") or "")
             if c not in need:
                 continue
+            _lone = (not v.get("father") and not v.get("mother"))
+            _filler = _lone and not v.get("spouses") and c not in _has_child
+            # ★ 2026-10-07 使用者（续七十一）：「**非史实、孤立的公卿男女，
+            #   除非当了诸侯或者我点了关注，否则要从「公卿自动关注」这条规则里
+            #   去掉**」⇒ 判据 = **非史实 + 无父无母**（有配偶 / 有子女都**不算**
+            #   豁免 —— 实测那批媵妾全都有配偶，正是靠旧判据漏进来的）。
+            _lone_nonhist = _lone and (v.get("historical") or "否") != "是"
+            if _filler or _lone_nonhist:
+                # ★ 2026-10-04 使用者裁定（**君主例外**）：「宗室填充人**不入谱**；
+                #   **除非他成了君主**，那么就挂靠他在该国**前任君主**旁边、算
+                #   **同代人**的族人。」判据唯一实现在 `app/gongqing.filler_exception`。
+                #   为什么必须要这个例外：跳过填充人的依据是「**谱内没有任何家族边**」，
+                #   而**继位不产生任何家族边** ⇒ 「日后成婚/生子就自愈」兜不住他，
+                #   他会一直当孤点浮在画布外。
+                # ⚠️⚠️ 2026-10-07 修：这里原来传的是 `src`（**槽的路径字符串**），
+                #   而 `filler_exception(slot, ...)` 要的是**槽对象**（内部
+                #   `rulers(slot)` → `slot.table(...)`）⇒ 一旦碰到**宗室填充人**
+                #   就 `AttributeError: 'str' object has no attribute 'table'`，
+                #   **整个自动关注当场中断**；而续谱那条路径是 `try/except` 包着的
+                #   （见 `_do_resume` 里 `except Exception: logger.warning(...)`）
+                #   ⇒ **界面不报错、只在日志留一行** —— 这就是「宋倩/宋珮 明明在
+                #   公卿家族成员表里、三个跳过口一个都不命中，却始终没被关注」的真因。
+                #   实测：修前 `focus_gongqing` 跑到第一个填充人就抛，关注名单
+                #   509 人纹丝不动；修后应能正常收人。
+                #   （`src` 是路径；此处 2508 行已经保证 `self.record_slot` 就是它。）
+                exc = GQ.filler_exception(self.record_slot, nm, self.people)
+                if not exc:
+                    if _lone_nonhist:
+                        lone_skip += 1
+                    else:
+                        filler_skip += 1
+                    continue
+                v["associate_of"] = exc["prev"]        # 挂靠在该国前任君主旁边
+                v["associate_type"] = "clan"           # 算**族人**（不画 ♥）
+                if exc.get("prev_gen") is not None:
+                    v["generation"] = exc["prev_gen"]  # 与前任**同代**
+                filler_king += 1
             if not v.get("enrolled"):
                 v["enrolled"] = True
                 added += 1
@@ -2545,10 +2650,40 @@ class ShiguanApp:
             self._enrolled_cache = None
             self._focus_set_cache = None
 
+        # ★ 2026-10-04 使用者：「公卿自动关注加一条规则，**如果该公卿被灭族了，
+        #   则该族全员取消关注**」。判据见 `app/gongqing.fallen_clans`
+        #   （家族仍在 Jia_Zu_Map、但类型不再是公室/宗室/卿室、且成员有人正被关注）。
+        #   取消关注**同时记进 `self.unfocused`**（按谱牒持久化）—— 那是「自动关注
+        #   永不回加」的保证，与「宗室填充人」清理同一套做法。
+        #   实测（Save_All_1，2026-10-04）：23 家类型为空的家族里 0 人仍被关注
+        #   ⇒ 本次 0 命中，这条规则是**预防性**的。
+        try:
+            fallen = GQ.fallen_clans(self.record_slot, need)
+        except Exception:
+            fallen = []
+        gone = 0
+        for _f in fallen:
+            for _c in _f["followed"]:
+                _nm = code2name.get(str(_c))
+                if _nm and _nm in self.focused:
+                    self.focused.remove(_nm)
+                    if _nm not in self.unfocused:
+                        self.unfocused.add(_nm)
+                    gone += 1
+        if fallen:
+            self.save_data()
+            self._focus_set_cache = None
+            logger.info("公卿自动关注：灭族/失爵 %d 家，取消关注 %d 人",
+                        len(fallen), gone)
+
         self._refresh_all()
         msg = (f"{len(fams)} 家 · 入谱 {len(need)} 人"
                + (f"（谱内已标 {added} 人）" if added else "")
-               + (f" · 关注新增 {focused_add} 人" if focused_add else ""))
+               + (f" · 关注新增 {focused_add} 人" if focused_add else "")
+               + (f" · 滤除宗室填充人 {filler_skip} 个" if filler_skip else "")
+               + (f" · 滤除非史孤立者 {lone_skip} 人" if lone_skip else "")
+               + (f" · 国君补关注 {_ruler_add} 人" if _ruler_add else "")
+               + (f" · 君主例外放行 {filler_king} 人" if filler_king else ""))
         if kin:
             msg += f" · 同宗共祖 {kin} 人"
         logger.info("公卿自动关注：" + msg)
